@@ -1,0 +1,6 @@
+- +experiment=infilling
+- model.name=/workspace/gfns-llm/infill_subj_arithmetic/input/stories_sft
+- replay_buffer.size=25
+- max_eval_len=25
+- eval_temp=0.9
+- +save_final=true

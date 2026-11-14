@@ -1,0 +1,1958 @@
+Started: 2026-11-12T23:10:10Z
+Base model: /workspace/gfns-llm/infill_subj_arithmetic/input/stories_sft
+Command: /workspace/gfns-llm/infill_subj_arithmetic/.venv-validated-py311/bin/python -u runpod_util.py --supervise /workspace/gfns-llm/infill_subj_arithmetic/.venv-validated-py311/bin/python -u main.py +experiment=infilling model.name=/workspace/gfns-llm/infill_subj_arithmetic/input/stories_sft replay_buffer.size=25 max_eval_len=25 eval_temp=0.9 +save_final=true hydra.run.dir=/workspace/gfns-llm/infill_subj_arithmetic/output/stories_gfn 
+
+===== run_gfn.sh =====
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+base_model="${GFN_BASE_MODEL:-$PWD/output/stories_sft}"
+steps="${GFN_TRAIN_STEPS:-1000}"
+[[ "$steps" =~ ^[1-9][0-9]*$ ]] || { echo "Error: GFN_TRAIN_STEPS must be positive." >&2; exit 1; }
+[[ -f "$base_model/config.json" ]] || { echo "Error: completed story-SFT model required at $base_model." >&2; exit 1; }
+[[ -f "$base_model/model.safetensors" || -f "$base_model/pytorch_model.bin" ||
+   -f "$base_model/model.safetensors.index.json" || -f "$base_model/pytorch_model.bin.index.json" ]] ||
+  { echo "Error: no full SFT model weights found at $base_model." >&2; exit 1; }
+base_model="$(cd "$base_model" && pwd)"
+
+if [[ "${1:-}" == "--worker" ]]; then
+  python_bin="$2"
+  if [[ -n "${3:-}" ]]; then
+    export STOP_RUNPOD_ON_EXIT=1 RUNPOD_CREDENTIALS_FILE="$3"
+  fi
+  output_dir="$PWD/output/stories_gfn"
+  mkdir -p "$output_dir"
+  log_path="$output_dir/train-$(date +%Y%m%d-%H%M%S).log"
+  train_command=("$python_bin" -u runpod_util.py --supervise "$python_bin" -u main.py +experiment=infilling
+    # "train_steps=$steps" removed: YAML config now controls train_steps
+    "model.name=$base_model" replay_buffer.size=25
+    max_eval_len=25 eval_temp=0.9 "+save_final=true" "hydra.run.dir=$output_dir")
+  {
+    printf 'Started: %s\nBase model: %s\nCommand: ' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$base_model"
+    printf '%q ' "${train_command[@]}"
+    printf '\n'
+    for script in run_gfn.sh main.py data.py rewards.py replay_buffer.py utils.py requirements.txt; do
+      printf '\n===== %s =====\n' "$script"
+      cat "$script"
+    done
+    find configs -type f -name '*.yaml' -exec sh -c 'printf "\n===== %s =====\n" "$1"; cat "$1"' sh {} \;
+    printf '\n===== Training output =====\n'
+  } > "$log_path"
+  printf '%s\n' "$log_path" > "$output_dir/active-log.txt"
+  set +e
+  "${train_command[@]}" 2>&1 | tee -a "$log_path"
+  status=$?
+  set -e
+  {
+    printf '\n===== Completion =====\nFinished: %s\nExit status: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$status"
+    if [[ "$status" -eq 0 && -f "$output_dir/train_results.json" ]]; then
+      cat "$output_dir/train_results.json"
+    fi
+  } | tee -a "$log_path"
+  printf '%s\n' "$status" > "$output_dir/.exit-status.tmp"
+  mv "$output_dir/.exit-status.tmp" "$output_dir/exit-status.txt"
+  exec bash
+fi
+
+command -v tmux >/dev/null || { echo "Error: install tmux first." >&2; exit 1; }
+if tmux has-session -t '=stories-gfn' 2>/dev/null; then
+  echo "Error: stories-gfn session already exists." >&2
+  exit 1
+fi
+python_bin="$(command -v python)"
+bash run_sft.sh --prepare-only
+[[ -f data/stories.csv ]] || { echo "Error: original stories.csv required for infilling." >&2; exit 1; }
+mkdir -p output/stories_gfn
+rm -f output/stories_gfn/exit-status.txt output/stories_gfn/active-log.txt
+export GFN_BASE_MODEL="$base_model" GFN_TRAIN_STEPS="$steps"
+printf -v worker_command '%q ' bash "$PWD/run_gfn.sh" --worker "$python_bin" "${RUNPOD_CREDENTIALS_FILE:-}"
+tmux new-session -d -s stories-gfn -c "$PWD" "$worker_command"
+tmux has-session -t '=stories-gfn'
+echo "Started GFlowNet infilling: $steps steps, base model $base_model"
+
+===== main.py =====
+from runpod_util import register_pod_shutdown
+
+register_pod_shutdown()
+
+import hydra
+import torch
+import numpy as np
+import random
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from tqdm import tqdm
+import bitsandbytes as bnb
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, PeftModel
+import wandb
+from omegaconf import OmegaConf
+import os
+import json
+from rich.table import Table
+from rich import print
+
+from utils import generate, generate_and_return_eos_logprob, append_sol_and_remove_eos, run_evaluation
+from rewards import load_reward
+from replay_buffer import load_replay_buffer
+from data import load_dataset
+
+
+def seed_everything(seed):
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def train(config, model, tokenizer, vocab_nice_list, rew, rbuffer, dataset):
+    logZ = torch.nn.Parameter(torch.tensor([config.logZ_init], dtype=torch.float, device=config.model.device))
+    if config.use_4bit:
+        opt = bnb.optim.PagedAdamW8bit([{'params': model.parameters(), 'lr': config.lr},
+                                {'params': [logZ,], 'lr': config.lr_logZ}])
+    else:
+        opt = torch.optim.AdamW([{'params': model.parameters(), 'lr': config.lr},
+                                {'params': [logZ,], 'lr': config.lr_logZ}])
+
+    pb = tqdm(range(config.train_steps))
+    desc_str = "Eval Reward: {:.3f} | Train Loss: {:.3f}, LogZ: {:.3f}, Reward: {:.3f}"
+    pb.set_description(desc_str.format(0, 0, 0, 0))
+    eval_reward = 0
+    
+    bsz = config.batch_size
+    grad_acc = config.grad_acc
+
+    pf_temp_high = config.pf_temp_high
+    pf_temp_low = config.pf_temp_low
+
+    subtb_lambda = config.subtb_lambda
+
+    max_len = config.max_len
+    max_eval_len = config.max_eval_len
+    min_len = config.min_len
+
+    loss_type = config.loss_type
+
+    reward_sched_start = config.reward_sched.start
+    reward_sched_end = config.reward_sched.end
+    reward_sched_horizon = config.reward_sched.horizon
+
+    get_reward_temp = lambda x : reward_sched_start + (reward_sched_end - reward_sched_start) * min(1, x / reward_sched_horizon)
+
+    encoded_train_queries = dataset["encoded_train_queries"]
+    encoded_train_sols = dataset["encoded_train_sols"]
+    encoded_test_queries = dataset["encoded_test_queries"]
+    train_weight = dataset["train_weight"]
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.eos_token_id
+    get_lr_at_step = lambda x : min(x/20*config.lr, config.lr)
+    
+    for step in pb:
+        opt.zero_grad()
+        loss = 0.
+        # change reward temperature
+        rew.temperature = get_reward_temp(step)
+        for pg in opt.param_groups:
+            pg['lr'] = get_lr_at_step(step)
+        for _ in range(grad_acc):
+            # select an example
+            #query_ind = random.randint(0, len(encoded_train_queries)-1)
+            query_ind = np.random.choice(np.arange(len(encoded_train_queries)), p=train_weight)
+            encoded_input = encoded_train_queries[query_ind]
+            encoded_result = encoded_train_sols[query_ind]
+            if loss_type.startswith('modified'):
+                # choose a behavior policy
+                b_policy_choice = random.randint(0, 3)
+                reward_fn = lambda x: rew.score(
+                                append_sol_and_remove_eos(x,
+                                                        encoded_result.repeat(bsz, 1),
+                                                        eos_token_id,
+                                                        pad_token_id),
+                                skip_first=encoded_input.size(-1),
+                                solution_len=encoded_result.size(-1))
+                if b_policy_choice == 0:
+                    # using the action policy without tempering
+                    generated_text, logPF, eos_logprob, logrewards = \
+                        generate_and_return_eos_logprob(model, 
+                                                        encoded_input.repeat(bsz, 1),
+                                                        eos_token_id=eos_token_id,
+                                                        vocab_nice_mask=vocab_nice_list,
+                                                        reward_fn=reward_fn,
+                                                        max_len=max_len,
+                                                        min_len=min_len,
+                                                        temperature=1,
+                                                        tokenizer=tokenizer,
+                                                        use_tools=config.use_tools,
+                                                        limit_capability=config.limit_capability,
+                                                        operators=config.operators,
+                                                        use_cache=not config.use_4bit)
+                    rbuffer.add_batch(query=encoded_input,
+                                    answer=encoded_result,
+                                    rationales=generated_text[:, encoded_input.size(-1):],
+                                    logrewards=logrewards * rew.temperature, # undo the effect of reward tempering
+                                    tokenizer=tokenizer)
+                elif b_policy_choice == 1 and rbuffer.sample(bsz, query=encoded_input, answer=encoded_result)[0] is not None: # and step > 10:
+                    # using samples from the replay buffer
+                    action_seq, logrewards = rbuffer.sample(bsz, query=encoded_input, answer=encoded_result)
+                    if action_seq is None:
+                        continue
+                    logrewards *= (1/rew.temperature) # redo the effect of reward tempering
+                    generated_text, logPF, eos_logprob, logrewards_2 = \
+                        generate_and_return_eos_logprob(model, 
+                                                        encoded_input.repeat(action_seq.size(0), 1),
+                                                        eos_token_id=eos_token_id,
+                                                        reward_fn=reward_fn,
+                                                        vocab_nice_mask=vocab_nice_list,
+                                                        max_len=max_len,
+                                                        min_len=min_len,
+                                                        action_seq=action_seq,
+                                                        skip_rewards=True,
+                                                        tokenizer=tokenizer,
+                                                        use_tools=False,
+                                                        limit_capability=config.limit_capability,
+                                                        operators=config.operators,
+                                                        use_cache=not config.use_4bit)
+                else:
+                    # using the action policy with tempering
+                    generated_text, logPF, eos_logprob, logrewards = \
+                        generate_and_return_eos_logprob(model, 
+                                                        encoded_input.repeat(bsz, 1),
+                                                        eos_token_id=eos_token_id,
+                                                        reward_fn=reward_fn,
+                                                        vocab_nice_mask=vocab_nice_list,
+                                                        max_len=max_len,
+                                                        min_len=min_len,
+                                                        temperature=random.random()*(pf_temp_high-pf_temp_low)+pf_temp_low,
+                                                        tokenizer=tokenizer,
+                                                        use_tools=config.use_tools,
+                                                        limit_capability=config.limit_capability,
+                                                        operators=config.operators,
+                                                        use_cache=not config.use_4bit)
+                    rbuffer.add_batch(query=encoded_input,
+                                    answer=encoded_result,
+                                    rationales=generated_text[:, encoded_input.size(-1):],
+                                    logrewards=logrewards * rew.temperature, # undo the effect of reward tempering
+                                    tokenizer=tokenizer)
+                if loss_type == 'modified_db':
+                    # modified db loss with logpb=0
+                    db_loss = (logrewards[:, :-1] + logPF[:, :-1] + eos_logprob[:, 1:] - logrewards[:, 1:] - eos_logprob[:, :-1])**2
+                    # get a mask for newly generated tokens after the first eos in generated_text
+                    mask = (generated_text[:, encoded_input.size(-1):] == eos_token_id).cumsum(dim=-1) > 1
+                    # if mask is too short, pad it
+                    if mask.size(-1) < max_len:
+                        mask = torch.cat([mask, torch.ones(mask.size(0), max_len-1-mask.size(-1), dtype=torch.bool, device='cuda')], dim=-1)
+                    mask = mask[:, :max_len]
+                    # get trajectory lengths by summing the mask
+                    traj_len = (~mask).sum(dim=-1)
+                    # get rid of the loss for the terminating step
+                    db_loss[mask] = 0
+                    batch_loss = db_loss.sum(-1) / traj_len
+                    #batch_loss = batch_loss.topk(bsz//2, largest=False, sorted=False).values.mean()
+                elif loss_type == 'modified_subtb':
+                    # modified subTB loss with logpb=0
+                    delta = (logrewards[:, :-1] - eos_logprob[:, :-1] + logPF[:, :-1] - (logrewards[:, 1:] - eos_logprob[:, 1:]))
+                    #delta = F.huber_loss(logrewards[:, :-1] + logPF[:, :-1] + eos_logprob[:, 1:],
+                    #                     logrewards[:, 1:] + eos_logprob[:, :-1],
+                    #                     delta=.1,
+                    #                     reduction='none')
+                    delta_cumsum = torch.cat( [ torch.zeros_like(delta[:, :1]), delta ], 1).cumsum(1)
+                    # get a mask for tokens after the first eos in generated_text
+                    mask = (generated_text == eos_token_id).cumsum(dim=-1) > 1
+                    mask = mask[:, encoded_input.size(-1):]
+                    mask = mask[:, :max_len]
+                    # if mask is too short, pad it
+                    if mask.size(-1) < max_len:
+                        mask = torch.cat([mask, torch.ones(mask.size(0), max_len-mask.size(-1), dtype=torch.bool, device='cuda')], dim=-1)
+                    # get trajectory lengths by summing the mask
+
+                    batch_loss = 0.
+                    total_lambda = 0.
+                    for subtraj_len in range(1, max_len+1):
+                        subtb_term = (delta_cumsum[:, subtraj_len:] - delta_cumsum[:, :-subtraj_len])**2
+                        subtb_term[mask[:, subtraj_len - 1:]] = 0
+                        batch_loss += subtb_lambda ** (subtraj_len - 1) * subtb_term.sum()
+                        total_lambda += subtb_lambda ** (subtraj_len - 1) * (~mask[:, subtraj_len - 1:]).sum()
+                    batch_loss /= total_lambda
+            else:
+                raise NotImplementedError
+            loss += batch_loss.mean()
+            batch_loss.mean().backward()
+        opt.step()
+        
+        if step % config.log_interval == 0:
+            print(f'logZ: {logZ.item()}, loss: {loss.item()}')
+        if step % config.full_eval_interval == 0:
+            # accuracy, incorrect_examples = run_evaluation(model, tokenizer, encoded_test_queries, 
+            #                           dataset["test_num_sols"], eos_token_id, pad_token_id, vocab_nice_list, max_eval_len,
+            #                           config.eval_bsz, config.use_tools, config.limit_capability, config.operators)
+            accuracy = test(config, model, tokenizer, vocab_nice_list, dataset, eos_token_id, pad_token_id, step, max_eval_len)
+            print('accuracy: ', accuracy)
+            wandb.log({"accuracy": accuracy}, commit=False)
+
+        if step % config.eval_interval == 0:
+            query_ind = random.randint(0, len(encoded_test_queries)-1)
+            encoded_input = encoded_test_queries[query_ind]
+
+            text, rewards = generate_examples(model, tokenizer, encoded_input, eos_token_id, pad_token_id, vocab_nice_list, rew, max_eval_len, config)
+            sols = dataset["test_sols"][query_ind] if "test_sols" in dataset and dataset["test_sols"] else "Test" 
+            print_table([dataset["test_queries"][query_ind]] * max_eval_len, text, [sols] * max_eval_len, rewards)
+
+            query_ind = random.randint(0, len(encoded_train_queries)-1)
+            encoded_input = encoded_train_queries[query_ind]
+            text, rewards = generate_examples(model, tokenizer, encoded_input, eos_token_id, pad_token_id, vocab_nice_list, rew, max_eval_len, config)
+            print_table([dataset["train_queries"][query_ind]] * max_eval_len, text, [dataset["train_sols"][query_ind]] * max_eval_len, rewards)
+
+            rbuffer.save(f"buffer_{step}.pkl.gz")
+            model.save_pretrained(f'{wandb.run.name}_{step}.pt')
+        
+        wandb.log({"loss": loss.mean().item(), 'reward': logrewards.mean().item()})
+        pb.set_description(desc_str.format(eval_reward, loss.mean().item(), logZ.item(), logrewards.mean().item()))
+
+    if config.get("save_final", False):
+        model.save_pretrained("final_adapter")
+        tokenizer.save_pretrained("final_adapter")
+        rbuffer.save("buffer_final.pkl.gz")
+        torch.save({"logZ": logZ.detach().cpu(), "optimizer": opt.state_dict(),
+                    "step": step + 1}, "training_state.pt")
+        with open("train_results.json", "w") as file:
+            json.dump({"steps": step + 1, "final_loss": loss.mean().item(),
+                       "final_logZ": logZ.item(),
+                       "final_log_reward": logrewards.mean().item()}, file, indent=2)
+
+def print_table(queries, rationales, solutions, rewards):
+    table = Table(show_header=True, header_style="bold blue")
+    table.add_column("Query", width=30)
+    table.add_column("Rationale", width=30)
+    table.add_column("Solution", width=30) if solutions is not None else None
+    table.add_column("Reward", width=10)
+    # import pdb; pdb.set_trace();
+    for query, rationale, solution, reward in zip(queries, rationales, solutions, rewards):
+        table.add_row(query, rationale[len(query):], solution, str(reward))
+    print(table)
+
+
+def generate_examples(model, tokenizer, encoded_input, eos_token_id, pad_token_id, vocab_nice_list, rew, max_eval_len, config):
+    generated_tokens, _, full_state = generate(model,
+                            encoded_input.repeat(10, 1),
+                            eos_token_id=eos_token_id,
+                            vocab_nice_mask=vocab_nice_list,
+                            max_len=max_eval_len,
+                            temperature=config.eval_temp,
+                            tokenizer=tokenizer,
+                            use_tools=config.use_tools,
+                            limit_capability=config.limit_capability,
+                            operators=config.operators,
+                            use_cache=not config.use_4bit)
+
+    generated_text = tokenizer.batch_decode(append_sol_and_remove_eos(full_state if config.use_tools else generated_tokens, [None,] * generated_tokens.size(0), eos_token_id, pad_token_id))
+    reward = rew.score(
+                    append_sol_and_remove_eos(full_state if config.use_tools else generated_tokens, [None,] * generated_tokens.size(0), eos_token_id, pad_token_id),
+                    skip_first=encoded_input.size(-1),
+                    solution_len=0).cpu().float().numpy().tolist()
+    return generated_text, reward
+
+
+def test(config, model, tokenizer, vocab_nice_list, dataset, eos_token_id, pad_token_id, step, max_eval_len):
+    # import pdb; pdb.set_trace();
+    if dataset["test_num_sols"] is not None:
+        accuracy, incorrect_examples = run_evaluation(model, tokenizer, dataset["encoded_test_queries"], 
+                                    dataset["test_num_sols"], eos_token_id, pad_token_id, vocab_nice_list, max_eval_len,
+                                    config.eval_bsz, config.use_tools, config.limit_capability, config.operators, not config.use_4bit)
+        with open(f'incorrect_examples_{step}.txt', 'w') as f:
+            for example in incorrect_examples:
+                f.write(str(example) + '\n')
+    
+        return accuracy
+    return 0
+
+
+def load_model(config):
+    if config.use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            llm_int8_has_fp16_weight=False,
+            bnb_4bit_quant_type="nf4",
+            llm_int8_threshold=6.0,
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(config.name,
+                                                trust_remote_code=True,
+                                                device_map="auto",
+                                                torch_dtype=torch.bfloat16,
+                                                quantization_config=bnb_config)
+        # model.gradient_checkpointing_enable()
+        model = prepare_model_for_kbit_training(model)
+        model.config.use_cache = False
+    else:
+        model = AutoModelForCausalLM.from_pretrained(config.name,
+                                                torch_dtype=torch.bfloat16,
+                                                trust_remote_code=True)
+        model.to(config.device)
+        # model.gradient_checkpointing_enable()
+    
+    tokenizer = AutoTokenizer.from_pretrained(config.name, add_bos_token=False)
+    
+    if config.use_lora and not config.test_only:
+        lora_config = LoraConfig(
+            r=config.lora_config.r,
+            lora_alpha=config.lora_config.alpha,
+            target_modules=list(config.lora_config.target_modules),
+            lora_dropout=config.lora_config.dropout,
+            bias="none",
+        )
+        lora_model = get_peft_model(model, lora_config)
+        return lora_model, tokenizer
+    if config.test_only and config.load_checkpoint_path is not None:
+        model = PeftModel.from_pretrained(model, config.load_checkpoint_path)
+    # model = torch.compile(model)
+    return model, tokenizer
+
+
+@hydra.main(version_base=None, config_path='./configs/', config_name='rationale_buffer')
+def main(config):
+    print(os.getcwd())
+    if not config.test_only:
+        wandb.init(project="rationale_buffer_llm", mode=config.wandb_mode, config=OmegaConf.to_container(config, resolve=True))
+    model, tokenizer = load_model(config.model)
+    dataset = load_dataset(config, tokenizer)
+    reward, vocab_nice_list = load_reward(config.reward, model, tokenizer, dataset, config.min_len)
+    if config.use_replay_buffer and not config.test_only:
+        rbuffer = load_replay_buffer(config.replay_buffer, model, dataset, tokenizer, reward, config.max_len, config.min_len, vocab_nice_list, not config.use_4bit)
+    
+    seed_everything(config.seed)
+    if not config.test_only:
+        train(config, model, tokenizer, vocab_nice_list, reward, rbuffer, dataset)
+    else:
+        
+        encoded_test_queries = dataset["encoded_test_queries"]
+        eos_token_id = tokenizer.eos_token_id
+        pad_token_id = tokenizer.eos_token_id
+        for _ in range(10):
+            query_ind = random.randint(0, len(encoded_test_queries)-1)
+            encoded_input = encoded_test_queries[query_ind]
+
+            text, rewards = generate_examples(model, tokenizer, encoded_input, eos_token_id, pad_token_id, vocab_nice_list, reward, config.max_eval_len, config)
+            print(f"Test example: {text}")
+            print(f'mean reward: {rewards}')
+
+        accuracy = test(config, model, tokenizer, vocab_nice_list, dataset, tokenizer.eos_token_id, tokenizer.eos_token_id, 0, config.max_eval_len)
+        print('accuracy: ', accuracy)
+
+if __name__ == '__main__':
+    main()
+
+===== data.py =====
+import numpy as np
+import pandas as pd
+import json
+from hydra.utils import to_absolute_path
+
+def load_dataset(config, tokenizer, append_prompt_test=None):
+    if config.dataset.name == "integer":
+        train_path = to_absolute_path(config.dataset.train_path)
+        hw_path = to_absolute_path(config.dataset.hw_path)
+        test_path = to_absolute_path(config.dataset.test_path)
+        
+        data_train = json.load(open(train_path, 'r'))
+        data_hw = json.load(open(hw_path, 'r'))
+        data_test = json.load(open(test_path, 'r'))
+
+        train_queries = []
+        train_rationales = []
+        train_sols = []
+        train_weight = []
+
+        test_queries = []
+        test_num_sols = []
+
+        for sample in data_train[:config.dataset.num_train]:
+            train_queries.append(sample['str_query'])
+            train_rationales.append(sample['str_rationale'])
+            train_sols.append(sample['str_sol'])
+            train_weight.append(1)
+        print("train_queries", len(train_queries))
+        for sample in data_hw[:config.dataset.num_hw]:
+            train_queries.append(sample['str_query'])
+            train_rationales.append(None)
+            train_sols.append(sample['str_sol'])
+            train_weight.append(0.2)
+
+        train_weight = np.array(train_weight)
+        train_weight = train_weight / train_weight.sum()
+
+        for sample in data_test[:config.dataset.num_test]:
+            if append_prompt_test:
+                test_queries.append(append_prompt_test + sample['str_query'])
+            else:
+                test_queries.append(sample['str_query'])
+            if "num_sol" in sample:
+                test_num_sols.append(sample['num_sol'])
+            else:
+                test_num_sols = None
+        
+        encoded_train_queries = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in train_queries]
+        encoded_train_sols = [tokenizer(answer, return_tensors='pt')['input_ids'].cuda() for answer in train_sols]
+        encoded_test_queries = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in test_queries]
+   
+    elif config.dataset.name == "stories":
+        df = pd.read_csv(to_absolute_path(config.dataset.path))
+        data = []
+
+        for index in range(100, 1000):
+            row = df.iloc[index]
+            story = {}
+            story["str_query"] = row["sentence1"] + " " + row["sentence2"] + " " + row["sentence3"]
+            story["str_sol"] = config.dataset.sol_prefix + row["sentence5"]
+            story["str_rationale"] = " " + row["sentence4"][:-1]
+            # print(row['sentence1'])
+            # if index == config.dataset.max_data:
+            #     break
+            data.append(story)
+        
+        train_queries = []
+        train_rationales = []
+        train_sols = []
+        train_weight = []
+
+        test_queries = []
+        test_num_sols = []
+        test_sols = []
+
+        for i, sample in enumerate(data):
+            train_queries.append(sample['str_query'])
+            if config.dataset.use_rationales and i < config.dataset.max_data:
+                train_rationales.append(sample['str_rationale'])
+            else:
+                train_rationales.append(None)
+            train_sols.append(sample['str_sol'])
+            train_weight.append(1)
+
+        train_weight = np.array(train_weight)
+        train_weight = train_weight / train_weight.sum()
+
+        for sample in data:
+            test_queries.append(sample['str_query'])
+            if "num_sol" in sample:
+                test_num_sols.append(sample['num_sol'])
+            else:
+                test_num_sols = None
+            test_sols.append(sample['str_sol'])
+        
+        encoded_train_queries = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in train_queries]
+        encoded_train_sols = [tokenizer(answer, return_tensors='pt')['input_ids'].cuda() for answer in train_sols]
+        encoded_test_queries = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in test_queries]
+    
+    elif config.dataset.name == "stories_in_prompt_2":
+        df = pd.read_csv(to_absolute_path(config.dataset.path))
+        data = []
+
+        for index in range(100, 1000):
+            row = df.iloc[index]
+            story = {}
+            story["str_query"] = "Beginning: " + row["sentence1"] + " " + row["sentence2"] + " " + row["sentence3"]
+            story["str_query"] += "\nEnding: " + row["sentence5"] + "\nMiddle:"
+            story["str_sol"] =  row["sentence5"]
+            story["str_rationale"] = " " + row["sentence4"]
+            story["beginning"] = row["sentence1"] + " " + row["sentence2"] + " " + row["sentence3"]
+            # print(row['sentence1'])
+            # if index == config.dataset.max_data:
+            #     break
+            data.append(story)
+        
+        train_queries = []
+        train_rationales = []
+        train_sols = []
+        train_weight = []
+        train_beginning = []
+
+        test_queries = []
+        test_num_sols = []
+        test_sols = []
+        test_beginning = []
+
+        for i, sample in enumerate(data):
+            train_queries.append(sample['str_query'])
+            if config.dataset.use_rationales and i < config.dataset.max_data:
+                train_rationales.append(sample['str_rationale'])
+            else:
+                train_rationales.append(None)
+            train_sols.append(sample['str_sol'])
+            train_weight.append(1)
+            train_beginning.append(sample['beginning'])
+
+        train_weight = np.array(train_weight)
+        train_weight = train_weight / train_weight.sum()
+
+        for sample in data:
+            test_queries.append(sample['str_query'])
+            if "num_sol" in sample:
+                test_num_sols.append(sample['num_sol'])
+            else:
+                test_num_sols = None
+            test_sols.append(sample['str_sol'])
+            test_beginning.append(sample['beginning'])
+        
+        encoded_train_queries = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in train_queries]
+        encoded_train_sols = [tokenizer(answer, return_tensors='pt')['input_ids'].cuda() for answer in train_sols]
+        encoded_test_queries = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in test_queries]
+        encoded_train_beginning = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in train_beginning]
+        encoded_test_beginning = [tokenizer(query, return_tensors='pt')['input_ids'].cuda() for query in test_beginning]
+        return {
+            "train_queries": train_queries,
+            "train_rationales": train_rationales,
+            "train_sols": train_sols,
+            "test_sols": test_sols,
+            "train_beginning": train_beginning,
+            "test_beginning": test_beginning,
+            "encoded_train_queries": encoded_train_queries,
+            "encoded_train_sols": encoded_train_sols,
+            "test_queries": test_queries,
+            "encoded_test_queries": encoded_test_queries,
+            "encoded_train_beginning": encoded_train_beginning,
+            "encoded_test_beginning": encoded_test_beginning,
+            "train_weight": train_weight if config.dataset.name == "integer" else None,
+            "test_num_sols": test_num_sols if config.dataset.name == "integer" else None,
+        }
+    else:
+        raise NotImplementedError("Please select a valid dataset.")
+
+    return {
+        "train_queries": train_queries,
+        "train_rationales": train_rationales,
+        "train_sols": train_sols,
+        "test_sols": test_sols if config.dataset.name == "stories" else None,
+        "encoded_train_queries": encoded_train_queries,
+        "encoded_train_sols": encoded_train_sols,
+        "test_queries": test_queries,
+        "encoded_test_queries": encoded_test_queries,
+        "train_weight": train_weight if config.dataset.name == "integer" else None,
+        "test_num_sols": test_num_sols if config.dataset.name == "integer" else None,
+    }
+===== rewards.py =====
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from utils import score_fast, lora_to_base, base_to_lora
+from hydra.utils import to_absolute_path
+import json
+from omegaconf import OmegaConf
+
+def get_reward(rewards, rewards_args):
+    # reward is a list with the names of rewards to consider
+    return globals()[rewards[0]](**rewards_args[0])
+
+
+class Reward:
+    def score(self, input_batch):
+        # input_batch is shape b x ... 
+        # output is shape b
+        raise NotImplementedError("")
+
+
+class FrozenModelWithPrompt(Reward):
+    def __init__(self, model, prompt, eos_token_id, temperature=1., min_len=0, vocab_alpha=-50.,
+                 solution_beta=1., vocab_nice_mask=None, vocab_naughty_mask=None, len_beta=0):
+        self.model = model
+        self.model.eval()
+        self.temperature = temperature
+        self.eos_token_id = eos_token_id
+        self.solution_beta = solution_beta
+        self.vocab_nice_mask = vocab_nice_mask
+        self.vocab_naughty_mask = vocab_naughty_mask
+        self.vocab_alpha = vocab_alpha
+        self.min_len = min_len
+        self.len_beta = len_beta
+        self.prompt = prompt
+        # self.prompt_cache = None
+        self.prompt_cache = self.model(self.prompt.cuda(), use_cache=True).past_key_values
+
+
+    def score(self, input_batch, skip_first, solution_len):
+        # self.model.eval()
+        #logprob = self.model(input_batch).logits[:,:-1].log_softmax(-1)
+        #token_ids = input_batch[:, 1:].unsqueeze(-1)
+        #logPF = logprob.gather(-1, token_ids).squeeze(-1)
+        # self.model.train()
+        #return logPF[:, self.skip_first-1:].sum(dim=-1) * (1./self.temperature)
+        lora_to_base(self.model)
+        with torch.no_grad():
+            res = score_fast(self.model,
+                            input_batch,
+                            self.eos_token_id,
+                            skip_first=skip_first,
+                            solution_len=solution_len,
+                            solution_beta=self.solution_beta,
+                            vocab_nice_mask=self.vocab_nice_mask,
+                            vocab_naughty_mask=self.vocab_naughty_mask,
+                            vocab_alpha=self.vocab_alpha,
+                            min_len=self.min_len,
+                            len_beta=self.len_beta, 
+                            prompt_cache=(self.prompt.cuda(), self.prompt_cache)) * (1./self.temperature)
+        base_to_lora(self.model)
+        return res
+
+
+class FrozenModel(Reward):
+    def __init__(self, model, eos_token_id, temperature=1., min_len=0, vocab_alpha=-50.,
+                 solution_beta=1., cot_beta=1., vocab_nice_mask=None, vocab_naughty_mask=None, len_beta=0):
+        self.model = model
+        self.model.eval()
+        self.temperature = temperature
+        self.eos_token_id = eos_token_id
+        self.solution_beta = solution_beta
+        self.cot_beta = cot_beta
+        self.vocab_nice_mask = vocab_nice_mask
+        self.vocab_naughty_mask = vocab_naughty_mask
+        self.vocab_alpha = vocab_alpha
+        self.min_len = min_len
+        self.len_beta = len_beta
+    def score(self, input_batch, skip_first, solution_len):
+        # self.model.eval()
+        #logprob = self.model(input_batch).logits[:,:-1].log_softmax(-1)
+        #token_ids = input_batch[:, 1:].unsqueeze(-1)
+        #logPF = logprob.gather(-1, token_ids).squeeze(-1)
+        # self.model.train()
+        #return logPF[:, self.skip_first-1:].sum(dim=-1) * (1./self.temperature)
+        lora_to_base(self.model)
+        with torch.no_grad():
+            res = score_fast(self.model,
+                            input_batch,
+                            self.eos_token_id,
+                            skip_first=skip_first,
+                            solution_len=solution_len,
+                            solution_beta=self.solution_beta,
+                            cot_beta=self.cot_beta,
+                            vocab_nice_mask=self.vocab_nice_mask,
+                            vocab_naughty_mask=self.vocab_naughty_mask,
+                            vocab_alpha=self.vocab_alpha,
+                            min_len=self.min_len,
+                            len_beta=self.len_beta) * (1./self.temperature)
+        base_to_lora(self.model)
+        return res
+
+def load_reward(config, model, tokenizer, dataset, min_len=0):
+    if config.impose_vocab_constraint:
+        def check_str(string, allow_char_set):
+            return all([c in allow_char_set for c in string])
+
+        allowed_indices = torch.tensor([item[1] for item in sorted(tokenizer.vocab.items(), key=lambda x: x[1]) if check_str(item[0], '▁Ġ,.1234567890=+-')], device='cuda', dtype=torch.long)
+        vocab_nice_list = torch.zeros(len(tokenizer.vocab), device='cuda').bool()
+        vocab_nice_list[allowed_indices] = True
+        vocab_nice_list[tokenizer.eos_token_id] = True
+    else: 
+        vocab_nice_list = None
+
+    rew_config = OmegaConf.to_container(config.reward_config, resolve=True)
+    rew_config["model"] = model
+    rew_config["eos_token_id"] = tokenizer.eos_token_id
+    rew_config["min_len"] = min_len
+    rew_config["vocab_nice_mask"] = vocab_nice_list
+
+    if config.reward_name=="FrozenModelWithPrompt" and "prompt_data" in rew_config:
+        data_path = to_absolute_path(config.reward_config.prompt_data.path)
+        data = json.load(open(data_path, 'r'))
+        train_queries = []
+        train_rationales = []
+        train_sols = []
+        for sample in data:
+            train_queries.append(sample['str_query'])
+            train_rationales.append(sample['str_rationale'])
+            train_sols.append(sample['str_sol'])
+        rew_config.pop("prompt_data")
+        prompt_text = '\n'.join([train_queries[i]+ " " + train_rationales[i]+train_sols[i] for i in range(config.reward_config.prompt_data.num_points)]) + '\n'
+        print("Prompt text: ", prompt_text)
+        rew_config["prompt"] = tokenizer(prompt_text, return_tensors='pt')['input_ids'].cuda()
+    
+    elif config.reward_name=="FrozenModelWithPrompt":
+        rew_config["prompt"] = tokenizer(rew_config["prompt"], return_tensors='pt')['input_ids'].cuda()
+    
+    rew = get_reward([config.reward_name], [rew_config])
+    return rew, vocab_nice_list
+===== replay_buffer.py =====
+import torch
+import heapq
+import random
+import pickle
+import gzip
+import numpy as np
+
+import editdistance
+from utils import base_to_lora, append_sol_and_remove_eos, generate_and_return_eos_logprob
+
+class ReplayBuffer:
+    '''
+    A relay buffer that uses a heap to keep the max_size items with the highest reward
+    '''
+    def __init__(self, max_len, eos_token_id, sim_tolerance=0.25):
+        self.max_len = max_len
+        self.eos_token_id = eos_token_id
+        self.sim_tolerance = sim_tolerance
+        self.reset()
+
+    def reset(self):
+        self._buffer = {}
+    
+    def add(self, item):
+        '''
+        add an item to the buffer, where item = [log reward, tensor of shape (seq_len, )]
+        '''
+        # if item is already in the buffer, skip it
+        # import pdb; pdb.set_trace();
+        str_query_answer = item['str_query_answer']
+        if item['str_rationale'] in self._buffer[str_query_answer]['exists']:
+            return
+        # if the edit distance between item and any item in the buffer is small, skip it
+        tokenized_rationale = [x for x in item['tensor_rationale'].tolist() if x != self.eos_token_id]
+        for buffer_item in self._buffer[str_query_answer]['rationales']:
+            tokenized_existing_rationale = [x for x in buffer_item[2].tolist() if x != self.eos_token_id]
+            if editdistance.eval(tokenized_rationale, tokenized_existing_rationale) < (len(tokenized_rationale) + len(tokenized_existing_rationale))*self.sim_tolerance:
+                if buffer_item[0] >= item['logreward']:
+                    return
+                else:
+                    self._buffer[str_query_answer]['exists'].remove(buffer_item[1])
+                    self._buffer[str_query_answer]['rationales'].remove(buffer_item)
+                    heapq.heapify(self._buffer[str_query_answer]['rationales'])
+                    self._buffer[str_query_answer]['exists'].add(item['str_rationale'])
+                    heapq.heappush(self._buffer[str_query_answer]['rationales'],
+                        (item['logreward'], item['str_rationale'], item['tensor_rationale'], item['full_logrewards']))
+                    return
+        self._buffer[str_query_answer]['exists'].add(item['str_rationale'])
+        if len(self._buffer[str_query_answer]['rationales']) >= self.max_len:
+            popped = heapq.heappushpop(self._buffer[str_query_answer]['rationales'],
+                                       (item['logreward'], item['str_rationale'], item['tensor_rationale'], item['full_logrewards']))
+            self._buffer[str_query_answer]['exists'].remove(popped[1])
+        else:
+            heapq.heappush(self._buffer[str_query_answer]['rationales'],
+                           (item['logreward'], item['str_rationale'], item['tensor_rationale'], item['full_logrewards']))
+
+    def add_batch(self, query, answer, rationales, logrewards, tokenizer):
+        '''
+        add a batch of items to the buffer
+        '''
+        str_query = ' '.join([str(x) for x in query.tolist()])
+        if answer is not None:
+            str_answer = ' '.join([str(x) for x in answer.tolist()])
+        else:
+            str_answer = 'None'
+        str_query_answer = '|'.join([str_query, str_answer])
+        if str_query_answer not in self._buffer:
+            self._buffer[str_query_answer] = {'tensor_query': query,
+                                              'tensor_answer': answer,
+                                              'rationales': [],
+                                              'exists': set()}
+        rationales[(rationales == self.eos_token_id).cumsum(dim=-1) >= 1] = self.eos_token_id
+        token_rationales = tokenizer.batch_decode(rationales)
+        for i in range(rationales.size(0)):
+            #str_rationale = ' '.join([str(x) for x in rationales[i].tolist() if x != self.eos_token_id])
+            str_rationale = token_rationales[i].replace('<|endoftext|>', '').strip()
+            self.add({'logreward': logrewards[i, (rationales[i] != self.eos_token_id).sum()].item(),
+                      'str_query_answer': str_query_answer,
+                      'str_rationale': str_rationale,
+                      'tensor_rationale': rationales[i],
+                      'full_logrewards': logrewards[i, :]})
+    
+    def sample(self, batch_size, query, answer):
+        '''
+        uniformly sample a batch of items from the buffer,
+        and return a stacked tensor
+        '''
+        str_query = ' '.join([str(x) for x in query.tolist()])
+        if answer is not None:
+            str_answer = ' '.join([str(x) for x in answer.tolist()])
+        else:
+            str_answer = 'None'
+        str_query_answer = '|'.join([str_query, str_answer])
+        if str_query_answer not in self._buffer:
+            return None, None
+        query_answer_buffer = self._buffer[str_query_answer]['rationales']
+        if len(query_answer_buffer) < batch_size:
+            # if the buffer is not full, use pad_sequence and return all items
+            return torch.nn.utils.rnn.pad_sequence([item[2] for item in query_answer_buffer],
+                                                   batch_first=True,
+                                                   padding_value=self.eos_token_id), \
+                   torch.nn.utils.rnn.pad_sequence([item[3] for item in query_answer_buffer],
+                                                   batch_first=True,
+                                                   padding_value=0)
+        else:
+            # do prioritized sampling
+            priorities  = [item[0] for item in query_answer_buffer]
+            priorities = np.array(priorities)
+            priorities = priorities - np.max(priorities)
+            idx = np.random.choice(len(query_answer_buffer), batch_size, p=np.exp(priorities)/np.sum(np.exp(priorities)), replace=True)
+            return torch.nn.utils.rnn.pad_sequence([query_answer_buffer[i][2] for i in idx],
+                                                   batch_first=True,
+                                                   padding_value=self.eos_token_id), \
+                   torch.nn.utils.rnn.pad_sequence([query_answer_buffer[i][3] for i in idx],
+                                                   batch_first=True,
+                                                   padding_value=0)
+    def print(self):
+        for key in self._buffer:
+            print(key)
+            for item in self._buffer[key]['rationales']:
+                print(item[1])
+            print('')
+    
+    def save(self, path):
+        with gzip.open(path, 'wb') as f:
+            pickle.dump(self._buffer, f)
+
+
+def load_replay_buffer(config, model, dataset, tokenizer, rew, max_len, min_len, vocab_nice_list, use_cache):
+    rbuffer = ReplayBuffer(config.size, eos_token_id=tokenizer.eos_token_id)
+    base_to_lora(model)
+    # add handcrafted rationales to the replay buffer
+    for i in range(len(dataset["encoded_train_queries"])):
+        if dataset["train_rationales"][i] is None:
+            continue
+        encoded_rationale = tokenizer(dataset["train_rationales"][i], return_tensors='pt')['input_ids'].cuda()
+        reward_fn = lambda x: rew.score(
+                                append_sol_and_remove_eos(x,
+                                                        dataset["encoded_train_sols"][i],
+                                                        tokenizer.eos_token_id,
+                                                        tokenizer.eos_token_id),
+                                skip_first=dataset["encoded_train_queries"][i].size(-1),
+                                solution_len=dataset["encoded_train_sols"][i].size(-1))
+        with torch.no_grad():
+            logrewards = generate_and_return_eos_logprob(model, 
+                                                            dataset["encoded_train_queries"][i],
+                                                            eos_token_id=tokenizer.eos_token_id,
+                                                            vocab_nice_mask=vocab_nice_list,
+                                                            reward_fn=reward_fn,
+                                                            max_len=max_len,
+                                                            min_len=min_len,
+                                                            temperature=1,
+                                                            action_seq=encoded_rationale,
+                                                            tokenizer=tokenizer,
+                                                            use_tools=config.use_tools,
+                                                            use_cache=use_cache)[3]
+        rbuffer.add_batch(query=dataset["encoded_train_queries"][i],
+                        answer=dataset["encoded_train_sols"][i],
+                        rationales=encoded_rationale,
+                        logrewards=logrewards,
+                        tokenizer=tokenizer)
+    return rbuffer
+
+===== utils.py =====
+from collections import Counter
+import torch
+from torch.distributions import Categorical
+import math
+import re
+from tqdm import tqdm
+
+def lora_to_base(model):
+    try:
+        model.base_model.disable_adapter_layers()
+    except:
+        print("No adapter layers to disable")
+    model.eval()
+    
+def base_to_lora(model):
+    try:
+        model.base_model.enable_adapter_layers()
+    except:
+        print("No adapter layers to enable")
+    model.train()
+
+def get_limited_expr(expr, k):
+    tokens = re.split('(-?\d+)', expr)
+    
+    if k > len(tokens)/2:
+        return expr
+
+    operands = tokens[1::2]
+    if len(operands) <= k:
+        return expr
+
+    operators = tokens[::2]
+    if k > 1:
+        operators = operators[:-1]
+
+    end_operands = operands[-k:]
+    if k > 1:
+        end_operators = operators[-(k-1):]
+    else: 
+        end_operators = []
+
+    end_expr = ''
+    for i in range(len(end_operands)):
+        if i > 0:
+            end_expr += end_operators[i-1]  
+            end_expr += end_operands[i]
+
+    return end_expr
+
+def generate(model, encoded_prompt, eos_token_id, max_len=10, temperature=1., vocab_nice_mask=None,
+                                    vocab_naughty_mask=None, vocab_alpha=-99, top_k=999999, top_p=1., tokenizer=None, use_tools=False,
+                                    limit_capability=0, operators=None, use_cache=True):
+    active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
+    logPF = encoded_prompt.new_zeros(encoded_prompt.size(0)).float()
+    actions = encoded_prompt.clone()
+    state = encoded_prompt.clone()
+    if use_cache:
+        past_key_values = model(state[:, :-1])['past_key_values']
+    if use_tools:
+        EQUAL_TOKS = [tokenizer.encode(" =")[-1], tokenizer.encode("=")[-1]]
+    for i in range(max_len):
+        if use_tools and i > 0:
+            if use_cache and past_key_values is not None:
+                output = model(state[:, -1:], attention_mask=state != eos_token_id, past_key_values=past_key_values)
+            else:
+                output = model(state, attention_mask=state != eos_token_id, position_ids=pos)
+        else:
+            if use_cache and not use_tools:
+                output = model(state[:, -1:], past_key_values=past_key_values)
+            else:
+                output = model(state)
+        if use_cache:
+            past_key_values = output['past_key_values']
+        with torch.no_grad():
+            prob = (output['logits'][:, -1, :]).softmax(dim=-1)
+            modified_logits = output['logits'][:, -1, :].clone()
+            # implement top-k by getting the top-k largest values and setting the rest to 0
+            if top_k < 999999:
+                modified_logits[prob >= prob.topk(top_k)] = -float('inf')
+            # implement top-p by getting indices in the top-p prob mass and setting the rest to 0
+            if top_p < 1.:
+                sorted_probs, indices = torch.sort(prob, dim=-1, descending=True)
+                cumsum_prob = torch.cumsum(sorted_probs, dim=-1)
+                nucleus = cumsum_prob < top_p
+                nucleus = torch.cat([nucleus.new_ones(nucleus.shape[:-1] + (1,)), nucleus[..., :-1]], dim=-1)
+                modified_logits[~nucleus] = -float('inf')
+            if vocab_nice_mask is not None:
+                # add vocab_alpha to the logits of the unmasked vocab items
+                modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+            prob = (modified_logits/temperature).softmax(dim=-1)
+            token_ids = torch.multinomial(prob, num_samples=1)
+        logprob = output['logits'][:, -1, :].log_softmax(dim=-1)
+        logPF += logprob.gather(-1, token_ids).squeeze(-1)
+        actions = torch.cat([actions, token_ids], dim=-1)
+        state = torch.cat([state, token_ids], dim=-1)
+        if use_tools:
+            tool_used=False
+            new_str = []
+            for j, tok in enumerate(token_ids):
+                if tok[0].item() in EQUAL_TOKS:
+                    expr = tokenizer.batch_decode(remove_left_pad([state[j]], eos_token_id, eos_token_id))[0]
+                    to_eval = expr.split("Answer:")[-1].split(',')[-1].split(".")[-1].split('=')[0]
+                    if limit_capability > 1 and to_eval!="":
+                        to_eval = get_limited_expr(to_eval, limit_capability)
+                    try:
+                        val = eval(to_eval)
+                        tool_used=True
+                    except:
+                        new_str.append(state[j])
+                        continue
+                    new_str.append(torch.cat((state[j], tokenizer.batch_encode_plus([" " + str(val)], return_tensors='pt')['input_ids'].cuda()[0])))
+                else:
+                    new_str.append(state[j])
+            state, pos, _ = left_pad(remove_left_pad(new_str, eos_token_id, eos_token_id, False), eos_token_id, eos_token_id)
+            state = state.cuda()
+            pos = pos.cuda()
+            if tool_used:
+                past_key_values = None
+        # check if all sequences have generated eos
+        active_seqs = active_seqs * (token_ids != eos_token_id).squeeze(-1)
+        if torch.all(~active_seqs):
+            break
+    return actions, logPF, remove_left_pad(state, eos_token_id, eos_token_id)
+
+def generate_and_return_eos_logprob(model, encoded_prompt, eos_token_id, reward_fn, vocab_nice_mask=None,
+                                    vocab_naughty_mask=None, vocab_alpha=-99, max_len=10, min_len=0,
+                                    temperature=1., top_k=999999, top_p=1., action_seq=None, skip_rewards=False,
+                                    tokenizer=None, use_tools=False, limit_capability=0, operators=None, use_cache=True):
+    # generate and return the probability of generating eos at every step
+    active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
+    actions = encoded_prompt.clone()
+    state = encoded_prompt.clone()
+    logpf = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    logeosprobs = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    logrewards = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    if use_cache:
+        past_key_values = model(state[:, :-1])['past_key_values']
+    if use_tools:
+        EQUAL_TOKS = [tokenizer.encode(" =")[-1], tokenizer.encode("=")[-1]]
+    if not skip_rewards:
+        logrewards[:, 0] = reward_fn(state)
+    for i in range(max_len):
+        if use_tools and i > 0:
+            if use_cache and past_key_values is not None:
+                output = model(state[:, -1:], attention_mask=state != eos_token_id, past_key_values=past_key_values)
+            else:
+                output = model(state, attention_mask=state != eos_token_id, position_ids=pos)
+        else:
+            if use_cache and not use_tools:
+                output = model(state[:, -1:], past_key_values=past_key_values)
+            else:
+                output = model(state)
+        if use_cache:
+            past_key_values = output['past_key_values']
+        if action_seq is None:
+            with torch.no_grad():
+                prob = (output['logits'][:, -1, :]).softmax(dim=-1)
+                modified_logits = output['logits'][:, -1, :].clone().detach()
+                # implement top-k by getting the top-k largest values and setting the rest to 0
+                if top_k < 999999:
+                    modified_logits[prob >= prob.topk(top_k)] = -float('inf')
+                # implement top-p by getting indices in the top-p prob mass and setting the rest to 0
+                if top_p < 1.:
+                    sorted_probs, indices = torch.sort(prob, dim=-1, descending=True)
+                    cumsum_prob = torch.cumsum(sorted_probs, dim=-1)
+                    nucleus = cumsum_prob < top_p
+                    nucleus = torch.cat([nucleus.new_ones(nucleus.shape[:-1] + (1,)), nucleus[..., :-1]], dim=-1)
+                    modified_logits[~nucleus] = -float('inf')
+                # if we haven't reach the minimum length, set the probability of generating eos to 0
+                if i < min_len:
+                    modified_logits[:, eos_token_id] = -float('inf')
+                if vocab_nice_mask is not None:
+                    # add vocab_alpha to the logits of the unmasked vocab items
+                    modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+                prob = (modified_logits/temperature).softmax(dim=-1)
+                token_ids = torch.multinomial(prob, num_samples=1)
+        else:
+            if i >= action_seq.size(-1):
+                token_ids = (torch.ones_like(action_seq[:, 0]) * eos_token_id).unsqueeze(-1)
+            else:
+                token_ids = action_seq[:, i].unsqueeze(-1)
+        token_ids = torch.where(active_seqs.unsqueeze(-1), token_ids, torch.ones_like(token_ids) * eos_token_id)
+        modified_logits = output['logits'][:, -1, :]
+        if vocab_nice_mask is not None:
+            modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+        logprob = modified_logits.log_softmax(dim=-1)
+        #print(logprob[0, eos_token_id])
+        #print(logprob.shape, token_ids.shape)
+        #print(logprob.shape, encoded_prompt.shape)
+        #print(actions.shape, output['logits'].shape)
+        logpf[:, i] = torch.where(active_seqs, logprob.gather(-1, token_ids).squeeze(-1), 0)
+        logeosprobs[:, i] = torch.where(active_seqs, logprob[:, eos_token_id], 0)
+        actions = torch.cat([actions, token_ids], dim=-1)
+        state = torch.cat([state, token_ids], dim=-1)
+        if use_tools:
+            tool_used=False
+            new_str = []
+            for j, tok in enumerate(token_ids):
+                if tok[0].item() in EQUAL_TOKS:
+                    # import pdb; pdb.set_trace();
+                    expr = tokenizer.batch_decode(remove_left_pad([state[j]], eos_token_id, eos_token_id))[0]
+                    to_eval = expr.split("Answer:")[-1].split(',')[-1].split(".")[-1].split('=')[0]
+                    if limit_capability > 1 and to_eval!="":
+                        to_eval = get_limited_expr(to_eval, limit_capability)
+                    try:
+                        val = eval(to_eval)
+                        tool_used=True
+                    except:
+                        new_str.append(state[j])
+                        continue
+                        # raise ValueError(f'Failed to evaluate {to_eval}')
+                    # new_str.append(expr + " " + str(val))
+                    new_str.append(torch.cat((state[j], tokenizer.batch_encode_plus([" " + str(val)], return_tensors='pt')['input_ids'].cuda()[0])))
+                    # new_str.append(tokenizer.batch_encode_plus([expr + " " + str(val)], return_tensors='pt')['input_ids'].cuda()[0])
+                else:
+                    new_str.append(state[j])
+            state, pos, _ = left_pad(remove_left_pad(new_str, eos_token_id, eos_token_id, False), eos_token_id, eos_token_id)
+            state = state.cuda()
+            pos = pos.cuda()
+            if tool_used:
+                past_key_values = None
+            # state = tokenizer.batch_encode_plus(new_str, return_tensors='pt')['input_ids'].cuda()
+        if not skip_rewards:
+            if use_tools:
+                logrewards[:, i+1] = torch.where(active_seqs, reward_fn(remove_left_pad(state, eos_token_id, eos_token_id)), 0)
+            else:
+                logrewards[:, i+1] = torch.where(active_seqs, reward_fn(actions), 0)
+        # check if all sequences have generated eos
+        active_seqs = active_seqs * (token_ids != eos_token_id).squeeze(-1)
+        if torch.all(~active_seqs):
+            break
+    # add eos to the end of the sequence
+    actions = torch.cat([actions, actions.new_ones(actions.size(0), 1)*eos_token_id], dim=-1)
+    logpf[:, -1] = 0
+    logeosprobs[:, -1] = 0
+    return actions, logpf, logeosprobs, logrewards
+
+def generate_and_return_terminate_logprob_v2(model, encoded_prompt, eos_token_id, reward_fn, vocab_nice_mask=None,
+                                    vocab_alpha=-99, max_len=10, min_len=0, sep_token_id=None, tokenizer=None,
+                                    temperature=1., top_k=999999, top_p=1., action_seq=None, skip_rewards=False):
+    # generate and return the probability of generating eos_token_id on every step
+    active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
+    stmt_sets = [set() for _ in range(encoded_prompt.size(0))]
+    cursors = [encoded_prompt.size(1) for _ in range(encoded_prompt.size(0))]
+    new_input = encoded_prompt.clone()
+    logpf = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    logeosprobs = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    logrewards = encoded_prompt.new_zeros(encoded_prompt.size(0), max_len+1).float()
+    if not skip_rewards:
+        logrewards[:, 0] = reward_fn(new_input)
+    for i in range(max_len):
+        output = model(new_input)
+        if action_seq is None:
+            with torch.no_grad():
+                prob = (output['logits'][:, -1, :]).softmax(dim=-1)
+                modified_logits = output['logits'][:, -1, :].clone().detach()
+                # implement top-k by getting the top-k largest values and setting the rest to 0
+                if top_k < 999999:
+                    modified_logits[prob >= prob.topk(top_k)] = -float('inf')
+                # implement top-p by getting indices in the top-p prob mass and setting the rest to 0
+                if top_p < 1.:
+                    sorted_probs, _ = torch.sort(prob, dim=-1, descending=True)
+                    cumsum_prob = torch.cumsum(sorted_probs, dim=-1)
+                    nucleus = cumsum_prob < top_p
+                    nucleus = torch.cat([nucleus.new_ones(nucleus.shape[:-1] + (1,)), nucleus[..., :-1]], dim=-1)
+                    modified_logits[~nucleus] = -float('inf')
+                # if we haven't reach the minimum length, set the probability of generating eos to 0
+                if i < min_len:
+                    modified_logits[:, eos_token_id] = -float('inf')
+                if vocab_nice_mask is not None:
+                    # add vocab_alpha to the logits of the unmasked vocab items
+                    modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+                if sep_token_id is not None:
+                    # make sure we don't generate duplicate statements
+                    for j, token_id in enumerate(token_ids):
+                        if token_id == sep_token_id and tuple(new_input[j, cursors[j]:].tolist()) in stmt_sets[j]:
+                            modified_logits[:, eos_token_id] = -float('inf')
+                            modified_logits[:, sep_token_id] = -float('inf')
+                prob = (modified_logits/temperature).softmax(dim=-1)
+                token_ids = torch.multinomial(prob, num_samples=1)
+        else:
+            if i >= action_seq.size(-1):
+                token_ids = (torch.ones_like(action_seq[:, 0]) * eos_token_id).unsqueeze(-1)
+            else:
+                token_ids = action_seq[:, i].unsqueeze(-1)
+        token_ids = torch.where(active_seqs.unsqueeze(-1), token_ids, torch.ones_like(token_ids) * eos_token_id)
+        if sep_token_id is not None:
+            # check if we have generated the separator token
+            for j, token_id in enumerate(token_ids):
+                if token_id == sep_token_id or token_id == eos_token_id:
+                    stmt_sets[j].add(tuple(new_input[j, cursors[j]:].tolist()))
+                    cursors[j] = new_input.size(1) + 1
+                    # replace the corresponding entry in new_input with the sorted sequences from the set
+                    sorted_stmts = tuple([ele for stmt in sorted([x+(sep_token_id,) for x in list(stmt_sets[j])]) for ele in stmt])[:-1]
+                    new_stmts = torch.tensor(sorted_stmts, device=encoded_prompt.device)
+                    #print(tokenizer.batch_decode([new_stmts]))
+                    new_input[j, encoded_prompt.size(1):encoded_prompt.size(1)+new_stmts.size(0)] = new_stmts
+            #print(cursors)
+        modified_logits = output['logits'][:, -1, :]
+        if vocab_nice_mask is not None:
+            modified_logits[:, ~vocab_nice_mask] += vocab_alpha
+        logprob = modified_logits.log_softmax(dim=-1)
+        logpf[:, i] = logprob.gather(-1, token_ids).squeeze(-1)
+        logeosprobs[:, i] = logprob[:, eos_token_id]
+        new_input = torch.cat([new_input, token_ids], dim=-1)
+        if not skip_rewards:
+            logrewards[:, i+1] = torch.where(active_seqs, reward_fn(new_input), 0)
+        # check if all sequences have generated eos
+        active_seqs = active_seqs * (token_ids != eos_token_id).squeeze(-1)
+        if torch.all(~active_seqs):
+            break
+    # add eos to the end of the sequence
+    new_input = torch.cat([new_input, new_input.new_ones(new_input.size(0), 1)*eos_token_id], dim=-1)
+    logpf[:, -1] = 0
+    logeosprobs[:, -1] = 0
+    return new_input, logpf, logeosprobs, logrewards
+
+def score(model, encoded_input, skip_first=1):
+    raise NotImplementedError
+    logPF = 0.
+    for i in range(skip_first, encoded_input.size(-1)):
+        output = model(encoded_input[:, :i])
+        logprob = output['logits'][:, -1, :].log_softmax(dim=-1)
+        token_id = encoded_input[:, i]
+        logPF += logprob.gather(-1, token_id.unsqueeze(-1)).squeeze(-1)
+    return logPF
+
+@torch.no_grad()
+def score_fast(model, encoded_input, eos_token_id, min_len=0,
+               skip_first=1, solution_len=0, solution_beta=1., cot_beta=1.,
+               vocab_nice_mask=None, vocab_naughty_mask=None,
+               vocab_alpha=-99, len_beta=0, reduction='sum', tokenizer=None,
+               prompt_cache=None):
+    if prompt_cache is None:
+        logits = model(encoded_input, attention_mask=encoded_input!=eos_token_id).logits[:,:-1,:]
+    else:
+        # prompt_cache[1] contains past_key_values which need to be reshaped to the right batch size from encoded_input
+        batched_prompt_cache = tuple(tuple([prompt_cache[1][i][j].repeat(encoded_input.shape[0], 1, 1, 1) for j in range(len(prompt_cache[1][i]))]) for i in range(len(prompt_cache[1])))
+        concat_input = torch.cat([prompt_cache[0].repeat(encoded_input.shape[0], 1), encoded_input], dim=-1)
+        attention_mask = concat_input != eos_token_id
+        logits = model(encoded_input, past_key_values=batched_prompt_cache, attention_mask=attention_mask).logits[:,:-1,:]
+    # get rid of the first few tokens
+    logits = logits[:, skip_first-1:]
+    non_eos_mask = (encoded_input != eos_token_id)[:, skip_first:]
+    # score the log probability of the input sequence while ignoring trailing eos
+    if vocab_nice_mask is not None:
+        # add vocab_alpha to the logits of the unmasked vocab items
+        # get a mask for the rationale
+        rat_mask = torch.concat([non_eos_mask[:, solution_len:],
+                                 encoded_input.new_zeros(encoded_input.size(0), solution_len)], dim=-1)
+        #print(tokenizer.batch_decode(encoded_input[:, skip_first:][rat_mask.bool()]))
+        logits[(rat_mask.float().unsqueeze(-1) @ (~vocab_nice_mask).float().unsqueeze(0)).bool()] += vocab_alpha
+        logprob = logits.log_softmax(-1)
+    elif vocab_naughty_mask is not None:
+        # add vocab_alpha to the logits of the masked vocab items
+        # get a mask for the rationale
+        rat_mask = torch.concat([non_eos_mask[:, solution_len:],
+                                 encoded_input.new_zeros(encoded_input.size(0), solution_len)], dim=-1)
+        logits[(rat_mask.float().unsqueeze(-1) @ vocab_naughty_mask.float().unsqueeze(0)).bool()] += vocab_alpha
+        logprob = logits.log_softmax(-1)
+    else:
+        # all the vocab items are allowed
+        logprob = logits.log_softmax(-1)
+    token_ids = encoded_input[:, skip_first:].unsqueeze(-1)
+    logPF = logprob.gather(-1, token_ids).squeeze(-1)
+    #print(tokenizer.batch_decode(token_ids[0]))
+    #print(logPF)
+    #for tok, logp in zip(tokenizer.batch_decode(token_ids[0]), logPF[0]):
+        #pass
+        #print(f'{tok}\t\t{logp.item():.3f}')
+    # change the log probability of eos to 0
+    logPF[encoded_input[:, skip_first:] == eos_token_id] = 0.
+    if (solution_len > 0 and solution_beta != 1.) or cot_beta != 1.:
+        # get a mask for the last solution_len tokens excluding eos
+        mask = torch.concat([(logPF == 0.)[:, solution_len:], logPF.new_ones(logPF.size(0), solution_len)], dim=-1)
+        # get the log probability of the solutions
+        logPF_solution = (logPF*mask).sum(dim=-1)
+        # get the log probability of the chain-of-thought
+        logPF_cot = (logPF*(1-mask)).sum(dim=-1) #* solution_beta
+        logPF_cot = logPF_cot / (non_eos_mask.sum(dim=-1) - solution_len + 1)**len_beta
+        return logPF_solution*(1/solution_beta) + logPF_cot*(1/cot_beta)
+    if reduction == 'sum':
+        res = logPF.sum(dim=-1)
+        res = torch.where((non_eos_mask.sum(dim=-1) - solution_len) < min_len, -99, res)
+    else:
+        res = logPF
+    return res
+
+@torch.no_grad()
+def reward_keywords(model, encoded_input, keywords, reward, skip_first=1, gamma=1.):
+    has_keywords = torch.isin(encoded_input[:, skip_first-1:], keywords).sum(dim=-1).bool()
+    #if torch.any(has_keywords):
+    #    import pdb; pdb.set_trace()
+    return torch.where(has_keywords, reward + math.log(gamma), reward)
+
+
+def append_eos(tokenizer, encoded_input):
+    return torch.cat([encoded_input, encoded_input.new_ones(encoded_input.size(0), 1)*tokenizer.eos_token_id], dim=-1)
+
+def append_seq(tokenizer, encoded_input, to_append):
+    encoded_to_append = tokenizer(to_append, return_tensors='pt')['input_ids'].cuda()
+    return torch.cat([encoded_input, encoded_to_append.repeat(encoded_input.size(0), 1)], dim=-1)
+
+def append_sol_and_remove_eos(text : torch.Tensor, result : torch.Tensor, eos_token_id : int, pad_token_id : int):
+    # remove anything after the first eos token and append the result
+    # if there is no eos token, append the result
+    # text is a torch tensor with the first dimension being the batch
+    # result is a torch tensor with the first dimension being the batch
+    # this is a vectorized implementation
+    # returns a torch tensor with the first dimension being the batch
+    # and the second dimension being the length of the sequence
+    new_text = []
+    for t, r in zip(text, result[:text.size(0)]):
+        if eos_token_id not in t:
+            new_text.append(t if r is None else torch.cat([t, r]))
+            continue
+        # find the first eos token
+        t[(t == eos_token_id).cumsum(dim=-1) >= 1] = eos_token_id
+        eos_ind = ((t == eos_token_id).cumsum(dim=-1) == 1).nonzero()[0]
+        # remove the eos tokens from the result and shift the result to the left
+        if r is not None:
+            new_text.append(torch.cat([t[:eos_ind], r]))
+        else:
+            new_text.append(t[:eos_ind])
+    return torch.nn.utils.rnn.pad_sequence(new_text, batch_first=True, padding_value=pad_token_id)
+
+
+
+def left_pad_generate(model, encoded_prompt, position_ids, eos_token_id, pad_token_id, max_len=10, temperature=1., top_k=999999, top_p=1.):
+    active_seqs = torch.ones(encoded_prompt.size(0)).bool().to(encoded_prompt.device)
+    logPF = encoded_prompt.new_zeros(encoded_prompt.size(0)).float()
+    new_input = encoded_prompt.clone()
+    for _ in range(max_len):
+        output = model(new_input, attention_mask=(new_input != pad_token_id).long(), position_ids=position_ids)
+        with torch.no_grad():
+            prob = (output['logits'][:, -1, :]).softmax(dim=-1)
+            modified_logits = output['logits'][:, -1, :].clone()
+            # implement top-k by getting the top-k largest values and setting the rest to 0
+            if top_k < 999999:
+                modified_logits[prob >= prob.topk(top_k)] = -float('inf')
+            # implement top-p by getting indices in the top-p prob mass and setting the rest to 0
+            if top_p < 1.:
+                sorted_probs, indices = torch.sort(prob, dim=-1, descending=True)
+                cumsum_prob = torch.cumsum(sorted_probs, dim=-1)
+                nucleus = cumsum_prob < top_p
+                nucleus = torch.cat([nucleus.new_ones(nucleus.shape[:-1] + (1,)), nucleus[..., :-1]], dim=-1)
+                modified_logits[~nucleus] = -float('inf')
+            prob = (modified_logits/temperature).softmax(dim=-1)
+            token_ids = torch.multinomial(prob, num_samples=1)
+        logprob = output['logits'][:, -1, :].log_softmax(dim=-1)
+        logPF += logprob.gather(-1, token_ids).squeeze(-1)
+        new_input = torch.cat([new_input, token_ids], dim=-1)
+        position_ids = torch.cat([position_ids, position_ids[:, -1:] + 1], dim=-1)
+        active_seqs = active_seqs * (token_ids != eos_token_id).squeeze(-1)
+        if torch.all(~active_seqs):
+            break
+    return new_input, logPF
+
+
+def remove_eos_and_pad_left(text : torch.Tensor, eos_token_id : int, pad_token_id : int):
+    """
+    remove anything after the first eos token, and left pad sequences"""
+    stripped_text = []
+    lens = []
+    position_ids = []
+    for t in text:
+        if eos_token_id not in t:
+            stripped_text.append(t)
+            position_ids.append(torch.arange(t.size(-1)))
+            lens.append(t.size(-1))
+            continue
+        # find the first eos token
+        t[(t == eos_token_id).cumsum(dim=-1) >= 1] = eos_token_id
+        eos_ind = ((t == eos_token_id).cumsum(dim=-1) == 1).nonzero()[0]
+        stripped_text.append(t[:eos_ind])
+        lens.append(eos_ind)
+        position_ids.append(torch.arange(eos_ind.item()))
+    left_pad_seqs = torch.nn.utils.rnn.pad_sequence([i.flip(0) for i in stripped_text], batch_first=True, padding_value=pad_token_id).flip(dims=[1]) 
+    left_pad_position_ids = torch.nn.utils.rnn.pad_sequence([i.flip(0) for i in position_ids], batch_first=True, padding_value=0).flip(dims=[1])
+    return left_pad_seqs, left_pad_position_ids, torch.tensor(lens)
+
+def left_pad(text : torch.Tensor, eos_token_id : int, pad_token_id : int):
+    stripped_text = []
+    lens = []
+    position_ids = []
+    for t in text:
+        # if eos_token_id not in t:
+        stripped_text.append(t)
+        
+        position_ids.append(torch.arange(t[(t != eos_token_id).cumsum(dim=-1) >= 1].size(-1)))
+        lens.append(t.size(-1))
+
+    left_pad_seqs = torch.nn.utils.rnn.pad_sequence([i.flip(0) for i in stripped_text], batch_first=True, padding_value=pad_token_id).flip(dims=[1]) 
+    left_pad_position_ids = torch.nn.utils.rnn.pad_sequence([i.flip(0) for i in position_ids], batch_first=True, padding_value=0).flip(dims=[1])
+    return left_pad_seqs, left_pad_position_ids, torch.tensor(lens)
+
+
+def remove_left_pad(text : torch.Tensor, eos_token_id : int, pad_token_id : int, return_padded: bool = True):
+    """
+    remove left padding and pad to the right"""
+    stripped_text = []
+    for t in text:
+        # t[(t != eos_token_id).cumsum(dim=-1) >= 1] = eos_token_id
+        # neos_ind = ((t != eos_token_id).cumsum(dim=-1) == 1).nonzero()[0]
+        stripped_text.append(t[(t != eos_token_id).cumsum(dim=-1) >= 1])
+        # stripped_text.append(torch.cat([t[-l:], t.new_ones(t.size(0), t.size(1)-l)*pad_token_id], dim=-1))
+    # print(stripped_text)
+    if return_padded:
+        return torch.nn.utils.rnn.pad_sequence(stripped_text, batch_first=True, padding_value=pad_token_id)
+    else:
+        return stripped_text
+
+def extract_answer(str_answer):
+    try:
+        try:
+            extracted_answer = int(str_answer.split('=')[-1].strip().strip('.'))
+        except:
+            extracted_answer = int(str_answer.split()[-1].strip().strip('.'))
+    except:
+        extracted_answer = -1
+    return extracted_answer
+
+def check_answer(str_answer, num_sol):
+    extracted_answer = extract_answer(str_answer)
+    if num_sol == extracted_answer:
+        return True
+    return False
+
+def run_evaluation(model, tokenizer, encoded_test_queries, test_num_sols, eos_token_id, pad_token_id, vocab_nice_list, max_eval_len, num_samples, use_tools, limit_capability=0, operators=None, use_cache=True):
+    base_to_lora(model)
+    model.eval()
+    test_correct = 0
+    test_total = 0
+    incorrect_answers = []
+    for query_ind in tqdm(range(len(encoded_test_queries))):
+        encoded_input = encoded_test_queries[query_ind]
+        with torch.no_grad():
+            generated_text, _, full_state = generate(model,
+                                    encoded_input.repeat(num_samples, 1),
+                                    eos_token_id=eos_token_id,
+                                    vocab_nice_mask=vocab_nice_list,
+                                    max_len=max_eval_len,
+                                    temperature=.1,
+                                    tokenizer=tokenizer,
+                                    use_tools=use_tools,
+                                    limit_capability=limit_capability,
+                                    operators=operators,
+                                    use_cache=use_cache)
+        decoded_answers = tokenizer.batch_decode(append_sol_and_remove_eos(full_state if use_tools else generated_text, [None,] * generated_text.size(0), eos_token_id, pad_token_id))
+        extracted_answers = [extract_answer(i) for i in decoded_answers]
+        answer = Counter(extracted_answers).most_common(1)[0][0]
+        # if check_answer(decoded_answer, test_num_sols[query_ind]):
+        if answer == test_num_sols[query_ind]:
+            test_correct += 1
+        else:
+            incorrect_answers.append(decoded_answers)
+        test_total += 1
+        # print(decoded_answer)
+    return test_correct / test_total, incorrect_answers
+
+===== requirements.txt =====
+torch==2.1.0
+transformers==4.34.0
+peft==0.5.0
+wandb==0.15.12
+setuptools==80.9.0
+rich==13.6.0
+hydra-core==1.3.2
+editdistance==0.6.2
+bitsandbytes==0.41.1
+tqdm==4.66.1
+numpy==1.26.0
+trl==0.7.1
+scipy==1.11.3
+ipykernel==6.25.2
+accelerate==0.23.0
+datasets==2.14.6
+pandas==2.1.4
+pyarrow==14.0.2
+===== configs/dataset/arithmetic_varying.yaml =====
+name: "integer"
+num_test: 100
+num_hw: 10000
+num_train: 10
+test_path: "data/arithmetic_with_tool/1digit_34_op+-_test.json"
+train_path: "data/arithmetic_with_tool/1digit_34_op+-_train_50.json"
+hw_path: "data/arithmetic_with_tool/1digit_34_op+-_hw.json"
+===== configs/dataset/stories.yaml =====
+name: "stories"
+path: "data/stories.csv"
+max_data: 100
+use_rationales: True
+sol_prefix: ". "
+===== configs/experiment/arithmetic_varying.yaml =====
+# @package _global_
+
+defaults:
+  - override /model: instruct_gptj
+  - override /reward: prompt
+  - override /dataset: arithmetic_varying
+
+use_tools: True
+
+reward:
+  reward_config:
+    prompt_data: 
+      path: "data/arithmetic/1digit_34_op+-_train_50.json"
+      num_points: 3
+limit_capability: 2
+
+min_len: 5
+batch_size: 16
+eval_temp: 0.1
+max_len: 18
+max_eval_len: 21
+
+reward_sched:
+  start: 1.1
+  end: 0.5
+  horizon: 150
+===== configs/experiment/infilling.yaml =====
+# @package _global_
+
+defaults:
+  - override /model: gpt2
+  - override /reward: without_prompt
+  - override /dataset: stories
+
+dataset:
+  name: 'stories_in_prompt_2'
+  max_data: 10000
+  use_rationales: True
+reward:
+  impose_vocab_constraint: False
+batch_size: 64
+grad_acc: 16
+max_len: 25
+use_reward_sched: True
+min_len: 5
+reward_sched:
+  start: 1.1
+  end: 0.85
+  horizon: 100
+
+===== configs/model/gpt2.yaml =====
+use_4bit: ${use_4bit}
+test_only: ${test_only}
+load_checkpoint_path: ${load_checkpoint_path}
+name: 'gpt2'
+device: 'cuda'
+use_lora: True
+save_path: null
+lora_config:
+  r: 64
+  alpha: 16
+  target_modules: ["c_attn", "c_proj"]
+  dropout: 0.1
+  bias: "none"
+===== configs/model/instruct_gptj.yaml =====
+use_4bit: ${use_4bit}
+test_only: ${test_only}
+load_checkpoint_path: ${load_checkpoint_path}
+name: 'nlpcloud/instruct-gpt-j-fp16'
+device: 'cuda'
+use_lora: True
+save_path: null
+lora_config:
+  r: 64
+  alpha: 16
+  target_modules: ["k_proj", "v_proj", "q_proj", "out_proj"]
+  dropout: 0.1
+  bias: "none"
+===== configs/rationale_buffer.yaml =====
+hydra:
+  job:
+    chdir: True
+  run:
+    dir: ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+defaults:
+  - reward: prompt
+  - dataset: integer
+  - model: instruct_gptj
+
+test_only: False
+load_checkpoint_path: null
+seed: 0
+use_4bit: False
+subtb_lambda: 1.
+max_len: 15
+max_eval_len: 15
+min_len: 0
+operators: ['+','-']
+limit_capability: -1
+loss_type: 'modified_subtb' # 'tb' 'tb_no_z' 'hvi' 'hvi_bl' 'pg'
+
+wandb_mode: "disabled"
+use_replay_buffer: True
+batch_size: 16
+train_steps: 2 # Original: 2000
+eval_bsz: 10
+grad_acc: 32
+lr: 0.0001
+lr_logZ: 1.
+pf_temp_high: 2
+pf_temp_low: 0.5
+logZ_init: 0.
+eval_interval: 10
+full_eval_interval: 50
+log_interval: 10
+eval_temp: 1.
+use_reward_sched: True
+use_tools: False
+
+reward_sched:
+  start: 1.0
+  end: 0.7
+  horizon: 200
+
+replay_buffer: 
+  size: 50
+  use_tools: ${use_tools}
+
+===== configs/reward/prompt.yaml =====
+impose_vocab_constraint: True
+reward_name: "FrozenModelWithPrompt"
+reward_config: 
+  temperature: 1
+  solution_beta: 1
+  len_beta: 0
+  # prompt: ""
+  # prompt: "The solution is"
+  vocab_alpha: -99
+  prompt_data:
+    path: "data/arithmetic/1digit_3_op+-_train.json"
+    num_points: 3
+    extra_text: ""
+===== configs/reward/without_prompt.yaml =====
+impose_vocab_constraint: True
+reward_name: "FrozenModel" # "FrozenModelWithPrompt"
+reward_config: 
+  temperature: 1
+  solution_beta: 1
+  len_beta: 0
+  # prompt: ""
+  # prompt: "The solution is"
+  vocab_alpha: -99
+  # prompt_data:
+  #   path: "data/arithmetic/1digit_3_op+-_train.json"
+  #   num_points: 3
+===== Training output =====
+Pod-side shutdown registered for training exit (success or failure).
+/workspace/gfns-llm/infill_subj_arithmetic/.venv-validated-py311/lib/python3.11/site-packages/wandb/sdk/launch/builder/build.py:11: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+/workspace/gfns-llm/infill_subj_arithmetic/.venv-validated-py311/lib/python3.11/site-packages/hydra/_internal/defaults_list.py:251: UserWarning: In 'rationale_buffer': Defaults list is missing `_self_`. See https://hydra.cc/docs/1.2/upgrades/1.0_to_1.1/default_composition_order for more information
+  warnings.warn(msg, UserWarning)
+/workspace/gfns-llm/infill_subj_arithmetic/output/stories_gfn
+Special tokens have been added in the vocabulary, make sure the associated word embeddings are fine-tuned or trained.
+/workspace/gfns-llm/infill_subj_arithmetic/.venv-validated-py311/lib/python3.11/site-packages/peft/tuners/lora.py:475: UserWarning: fan_in_fan_out is set to False but the target module is `Conv1D`. Setting fan_in_fan_out to True.
+  warnings.warn(
+  0%|          | 0/2 [00:00<?, ?it/s]Eval Reward: 0.000 | Train Loss: 0.000, LogZ: 0.000, Reward: 0.000:   0%|          | 0/2 [00:00<?, ?it/s]logZ: 0.0, loss: 16583.962890625
+accuracy:  0
+┏━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━┓
+┃ Query                  ┃ Rationale              ┃ Solution               ┃ … ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━┩
+│ Beginning: Jill wanted │  Jill's family decided │ Jill bought the puppy  │ … │
+│ a pet for her family.  │ to name her new puppy  │ and brought it home to │   │
+│ She went to the pet    │ Spot. After a few      │ her family.            │   │
+│ store to look for an   │ weeks, Jill learned    │                        │   │
+│ animal. She wasn't     │ that she loved Spot!   │                        │   │
+│ sure if there were any │ Now,                   │                        │   │
+│ pets still available.  │                        │                        │   │
+│ Ending: Jill bought    │                        │                        │   │
+│ the puppy and brought  │                        │                        │   │
+│ it home to her family. │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Jill wanted │  Jill's family named   │ Jill bought the puppy  │ … │
+│ a pet for her family.  │ the puppy after her.   │ and brought it home to │   │
+│ She went to the pet    │ Every time she comes   │ her family.            │   │
+│ store to look for an   │ home, she gives them a │                        │   │
+│ animal. She wasn't     │ new puppy. Now, Jill   │                        │   │
+│ sure if there were any │                        │                        │   │
+│ pets still available.  │                        │                        │   │
+│ Ending: Jill bought    │                        │                        │   │
+│ the puppy and brought  │                        │                        │   │
+│ it home to her family. │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Jill wanted │  Jill's family was     │ Jill bought the puppy  │ … │
+│ a pet for her family.  │ very happy with the    │ and brought it home to │   │
+│ She went to the pet    │ new animal. They       │ her family.            │   │
+│ store to look for an   │ decided they would     │                        │   │
+│ animal. She wasn't     │ name it Applesauce.    │                        │   │
+│ sure if there were any │ Jill was happy         │                        │   │
+│ pets still available.  │                        │                        │   │
+│ Ending: Jill bought    │                        │                        │   │
+│ the puppy and brought  │                        │                        │   │
+│ it home to her family. │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Jill wanted │  Jill loved her new    │ Jill bought the puppy  │ … │
+│ a pet for her family.  │ pet. It was now part   │ and brought it home to │   │
+│ She went to the pet    │ of the family! Jill    │ her family.            │   │
+│ store to look for an   │ had a happy ending to  │                        │   │
+│ animal. She wasn't     │ her shopping           │                        │   │
+│ sure if there were any │ experience. She        │                        │   │
+│ pets still available.  │                        │                        │   │
+│ Ending: Jill bought    │                        │                        │   │
+│ the puppy and brought  │                        │                        │   │
+│ it home to her family. │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Jill wanted │  Jill's family had a   │ Jill bought the puppy  │ … │
+│ a pet for her family.  │ new dog! They were     │ and brought it home to │   │
+│ She went to the pet    │ very happy with their  │ her family.            │   │
+│ store to look for an   │ new addition. Jill's   │                        │   │
+│ animal. She wasn't     │ family was thrilled    │                        │   │
+│ sure if there were any │ with their new         │                        │   │
+│ pets still available.  │                        │                        │   │
+│ Ending: Jill bought    │                        │                        │   │
+│ the puppy and brought  │                        │                        │   │
+│ it home to her family. │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Jill wanted │  Jill's family fell in │ Jill bought the puppy  │ … │
+│ a pet for her family.  │ love with the puppy    │ and brought it home to │   │
+│ She went to the pet    │ and name it Blue. Now, │ her family.            │   │
+│ store to look for an   │ Jill's family has      │                        │   │
+│ animal. She wasn't     │ three puppies and it's │                        │   │
+│ sure if there were any │                        │                        │   │
+│ pets still available.  │                        │                        │   │
+│ Ending: Jill bought    │                        │                        │   │
+│ the puppy and brought  │                        │                        │   │
+│ it home to her family. │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Jill wanted │  Jill's family decided │ Jill bought the puppy  │ … │
+│ a pet for her family.  │ to just call it family │ and brought it home to │   │
+│ She went to the pet    │ puppy. They all liked  │ her family.            │   │
+│ store to look for an   │ the dog too much! Jill │                        │   │
+│ animal. She wasn't     │ decided to keep the    │                        │   │
+│ sure if there were any │ puppy                  │                        │   │
+│ pets still available.  │                        │                        │   │
+│ Ending: Jill bought    │                        │                        │   │
+│ the puppy and brought  │                        │                        │   │
+│ it home to her family. │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Jill wanted │  Every day Jill and    │ Jill bought the puppy  │ … │
+│ a pet for her family.  │ her family played with │ and brought it home to │   │
+│ She went to the pet    │ the puppy. It became   │ her family.            │   │
+│ store to look for an   │ their best friend!     │                        │   │
+│ animal. She wasn't     │ They were so happy     │                        │   │
+│ sure if there were any │ that they could        │                        │   │
+│ pets still available.  │ finally                │                        │   │
+│ Ending: Jill bought    │                        │                        │   │
+│ the puppy and brought  │                        │                        │   │
+│ it home to her family. │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Jill wanted │  Jill and her family   │ Jill bought the puppy  │ … │
+│ a pet for her family.  │ loved the puppy they   │ and brought it home to │   │
+│ She went to the pet    │ found. Jill's family   │ her family.            │   │
+│ store to look for an   │ was happy they got a   │                        │   │
+│ animal. She wasn't     │ new friend. They were  │                        │   │
+│ sure if there were any │ happy they             │                        │   │
+│ pets still available.  │                        │                        │   │
+│ Ending: Jill bought    │                        │                        │   │
+│ the puppy and brought  │                        │                        │   │
+│ it home to her family. │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Jill wanted │  Jill's family ended   │ Jill bought the puppy  │ … │
+│ a pet for her family.  │ up with two new        │ and brought it home to │   │
+│ She went to the pet    │ puppies! They ended up │ her family.            │   │
+│ store to look for an   │ being very happy with  │                        │   │
+│ animal. She wasn't     │ their new pets. Jill   │                        │   │
+│ sure if there were any │ thinks she has         │                        │   │
+│ pets still available.  │                        │                        │   │
+│ Ending: Jill bought    │                        │                        │   │
+│ the puppy and brought  │                        │                        │   │
+│ it home to her family. │                        │                        │   │
+│ Middle:                │                        │                        │   │
+└────────────────────────┴────────────────────────┴────────────────────────┴───┘
+┏━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━┓
+┃ Query                  ┃ Rationale              ┃ Solution               ┃ … ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━┩
+│ Beginning: Saturday    │  She was happy because │ Her neighbors loved    │ … │
+│ was the annual         │ they also got fresh    │ the cookies and ate    │   │
+│ neighborhood picnic.   │ baked goods! Finally,  │ every last one.        │   │
+│ Sally had to decide    │ they both had a fun    │                        │   │
+│ what dish to bring to  │ time. Everyone had a   │                        │   │
+│ share with her         │ great time             │                        │   │
+│ neighbors. She walked  │                        │                        │   │
+│ down every aisle at    │                        │                        │   │
+│ the store trying to    │                        │                        │   │
+│ pick something.        │                        │                        │   │
+│ Ending: Her neighbors  │                        │                        │   │
+│ loved the cookies and  │                        │                        │   │
+│ ate every last one.    │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Saturday    │  Sally felt like a     │ Her neighbors loved    │ … │
+│ was the annual         │ fool and went home     │ the cookies and ate    │   │
+│ neighborhood picnic.   │ without any food.      │ every last one.        │   │
+│ Sally had to decide    │ Everyone had a fun     │                        │   │
+│ what dish to bring to  │ time and thanked her   │                        │   │
+│ share with her         │ for the cookies. She   │                        │   │
+│ neighbors. She walked  │                        │                        │   │
+│ down every aisle at    │                        │                        │   │
+│ the store trying to    │                        │                        │   │
+│ pick something.        │                        │                        │   │
+│ Ending: Her neighbors  │                        │                        │   │
+│ loved the cookies and  │                        │                        │   │
+│ ate every last one.    │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Saturday    │  Sally had forgotten   │ Her neighbors loved    │ … │
+│ was the annual         │ to bring them and they │ the cookies and ate    │   │
+│ neighborhood picnic.   │ were disappointed. She │ every last one.        │   │
+│ Sally had to decide    │ ended up having a good │                        │   │
+│ what dish to bring to  │ time without them. Now │                        │   │
+│ share with her         │ they know how          │                        │   │
+│ neighbors. She walked  │                        │                        │   │
+│ down every aisle at    │                        │                        │   │
+│ the store trying to    │                        │                        │   │
+│ pick something.        │                        │                        │   │
+│ Ending: Her neighbors  │                        │                        │   │
+│ loved the cookies and  │                        │                        │   │
+│ ate every last one.    │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Saturday    │  She got chocolate on  │ Her neighbors loved    │ … │
+│ was the annual         │ her way home from the  │ the cookies and ate    │   │
+│ neighborhood picnic.   │ store. It was one of   │ every last one.        │   │
+│ Sally had to decide    │ her best weekends      │                        │   │
+│ what dish to bring to  │ ever. She couldn't     │                        │   │
+│ share with her         │ wait to                │                        │   │
+│ neighbors. She walked  │                        │                        │   │
+│ down every aisle at    │                        │                        │   │
+│ the store trying to    │                        │                        │   │
+│ pick something.        │                        │                        │   │
+│ Ending: Her neighbors  │                        │                        │   │
+│ loved the cookies and  │                        │                        │   │
+│ ate every last one.    │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Saturday    │  Sally sighed and went │ Her neighbors loved    │ … │
+│ was the annual         │ to get ice cream.      │ the cookies and ate    │   │
+│ neighborhood picnic.   │ Everyone had a fun     │ every last one.        │   │
+│ Sally had to decide    │ day! They all agreed   │                        │   │
+│ what dish to bring to  │ that they would return │                        │   │
+│ share with her         │ next year.             │                        │   │
+│ neighbors. She walked  │                        │                        │   │
+│ down every aisle at    │                        │                        │   │
+│ the store trying to    │                        │                        │   │
+│ pick something.        │                        │                        │   │
+│ Ending: Her neighbors  │                        │                        │   │
+│ loved the cookies and  │                        │                        │   │
+│ ate every last one.    │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Saturday    │  Sally was happy she   │ Her neighbors loved    │ … │
+│ was the annual         │ had won a new dog. She │ the cookies and ate    │   │
+│ neighborhood picnic.   │ named the dog Spot and │ every last one.        │   │
+│ Sally had to decide    │ they became best       │                        │   │
+│ what dish to bring to  │ friends. Sally         │                        │   │
+│ share with her         │ couldn't wait          │                        │   │
+│ neighbors. She walked  │                        │                        │   │
+│ down every aisle at    │                        │                        │   │
+│ the store trying to    │                        │                        │   │
+│ pick something.        │                        │                        │   │
+│ Ending: Her neighbors  │                        │                        │   │
+│ loved the cookies and  │                        │                        │   │
+│ ate every last one.    │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Saturday    │  She got sick of it    │ Her neighbors loved    │ … │
+│ was the annual         │ and decided to go home │ the cookies and ate    │   │
+│ neighborhood picnic.   │ early. She made a list │ every last one.        │   │
+│ Sally had to decide    │ and went home, perhaps │                        │   │
+│ what dish to bring to  │ it would help her      │                        │   │
+│ share with her         │                        │                        │   │
+│ neighbors. She walked  │                        │                        │   │
+│ down every aisle at    │                        │                        │   │
+│ the store trying to    │                        │                        │   │
+│ pick something.        │                        │                        │   │
+│ Ending: Her neighbors  │                        │                        │   │
+│ loved the cookies and  │                        │                        │   │
+│ ate every last one.    │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Saturday    │  She realized she      │ Her neighbors loved    │ … │
+│ was the annual         │ hadn't brought her     │ the cookies and ate    │   │
+│ neighborhood picnic.   │ favorite sandwich.     │ every last one.        │   │
+│ Sally had to decide    │ Maybe she would share  │                        │   │
+│ what dish to bring to  │ with them next year.   │                        │   │
+│ share with her         │ Her neighbors were     │                        │   │
+│ neighbors. She walked  │ pleased she thought    │                        │   │
+│ down every aisle at    │                        │                        │   │
+│ the store trying to    │                        │                        │   │
+│ pick something.        │                        │                        │   │
+│ Ending: Her neighbors  │                        │                        │   │
+│ loved the cookies and  │                        │                        │   │
+│ ate every last one.    │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Saturday    │  She got nothing, they │ Her neighbors loved    │ … │
+│ was the annual         │ were all peanut        │ the cookies and ate    │   │
+│ neighborhood picnic.   │ butter. She went home  │ every last one.        │   │
+│ Sally had to decide    │ sad and never brought  │                        │   │
+│ what dish to bring to  │ anything to share with │                        │   │
+│ share with her         │ them again. They       │                        │   │
+│ neighbors. She walked  │                        │                        │   │
+│ down every aisle at    │                        │                        │   │
+│ the store trying to    │                        │                        │   │
+│ pick something.        │                        │                        │   │
+│ Ending: Her neighbors  │                        │                        │   │
+│ loved the cookies and  │                        │                        │   │
+│ ate every last one.    │                        │                        │   │
+│ Middle:                │                        │                        │   │
+│ Beginning: Saturday    │  She had such a good   │ Her neighbors loved    │ … │
+│ was the annual         │ time and they all      │ the cookies and ate    │   │
+│ neighborhood picnic.   │ wished her a happy     │ every last one.        │   │
+│ Sally had to decide    │ birthday. Actually,    │                        │   │
+│ what dish to bring to  │ they wished her a      │                        │   │
+│ share with her         │ happy birthday too!    │                        │   │
+│ neighbors. She walked  │                        │                        │   │
+│ down every aisle at    │                        │                        │   │
+│ the store trying to    │                        │                        │   │
+│ pick something.        │                        │                        │   │
+│ Ending: Her neighbors  │                        │                        │   │
+│ loved the cookies and  │                        │                        │   │
+│ ate every last one.    │                        │                        │   │
+│ Middle:                │                        │                        │   │
+└────────────────────────┴────────────────────────┴────────────────────────┴───┘
+Eval Reward: 0.000 | Train Loss: 16583.963, LogZ: 0.000, Reward: -71.781:   0%|          | 0/2 [00:57<?, ?it/s]Eval Reward: 0.000 | Train Loss: 16583.963, LogZ: 0.000, Reward: -71.781:  50%|█████     | 1/2 [00:57<00:57, 57.08s/it]Eval Reward: 0.000 | Train Loss: 17517.711, LogZ: 0.000, Reward: -64.952:  50%|█████     | 1/2 [01:41<00:57, 57.08s/it]Eval Reward: 0.000 | Train Loss: 17517.711, LogZ: 0.000, Reward: -64.952: 100%|██████████| 2/2 [01:41<00:00, 49.41s/it]Eval Reward: 0.000 | Train Loss: 17517.711, LogZ: 0.000, Reward: -64.952: 100%|██████████| 2/2 [01:41<00:00, 50.56s/it]
+Requesting stop for pod mum16024l4fsld using RunPod SDK...

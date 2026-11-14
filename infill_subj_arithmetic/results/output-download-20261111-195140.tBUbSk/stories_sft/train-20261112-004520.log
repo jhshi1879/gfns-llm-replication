@@ -1,0 +1,699 @@
+Started: 2026-11-12T00:45:20Z
+Working directory: /workspace/gfns-llm/infill_subj_arithmetic
+Python: /workspace/gfns-llm/infill_subj_arithmetic/.venv-validated-py311/bin/python
+Training command: /workspace/gfns-llm/infill_subj_arithmetic/.venv-validated-py311/bin/python -u sft.py --model_name gpt2-large --use_auth_token False --output_dir output/stories_sft --learning_rate 0.0005 --batch_size 64 --gradient_accumulation_steps 32 --save_total_limit 1 --num_train_epochs 2 
+
+===== run_sft.sh =====
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+if [[ "${1:-}" == "--worker" ]]; then
+  python_bin="$2"
+  if [[ -n "${3:-}" ]]; then
+    export STOP_RUNPOD_ON_EXIT=1 RUNPOD_CREDENTIALS_FILE="$3"
+  fi
+  mkdir -p output/stories_sft
+  log_path="output/stories_sft/train-$(date +%Y%m%d-%H%M%S).log"
+  train_command=("$python_bin" -u sft.py
+    --model_name gpt2-large \
+    --use_auth_token False \
+    --output_dir output/stories_sft \
+    --learning_rate 0.0005 \
+    --batch_size 64 \
+    --gradient_accumulation_steps 32 \
+    --save_total_limit 1 \
+    --num_train_epochs 2)
+  {
+    printf 'Started: %s\nWorking directory: %s\nPython: %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" "$python_bin"
+    printf 'Training command: '
+    printf '%q ' "${train_command[@]}"
+    printf '\n'
+    for script in run_sft.sh sft.py requirements.txt run_sft_remote.sh validate_training_env.py \
+                  output/stories_sft/preflight-passed.json output/stories_sft/requirements.lock.txt; do
+      if [[ -f "$script" ]]; then
+        printf '\n===== %s =====\n' "$script"
+        cat "$script"
+      fi
+    done
+    printf '\n===== Training output =====\n'
+  } > "$log_path"
+  printf '%s\n' "$log_path" > output/stories_sft/active-log.txt
+  set +e
+  "${train_command[@]}" 2>&1 | tee -a "$log_path"
+  status=$?
+  set -e
+  {
+    printf '\n===== Completion =====\nFinished: %s\nExit status: %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$status"
+    printf 'Model output directory: %s/output/stories_sft\n' "$PWD"
+    if [[ "$status" -eq 0 && -f output/stories_sft/train_results.json ]]; then
+      printf '\n===== Final training results =====\n'
+      cat output/stories_sft/train_results.json
+    fi
+    if [[ -f output/stories_sft/config.json ]]; then
+      printf '\n===== Saved model configuration =====\n'
+      cat output/stories_sft/config.json
+    fi
+  } | tee -a "$log_path"
+  printf '\nSFT exited with status %s. Log: %s\n' "$status" "$log_path"
+  printf '%s\n' "$status" > output/stories_sft/.exit-status.tmp
+  mv output/stories_sft/.exit-status.tmp output/stories_sft/exit-status.txt
+  exec bash
+fi
+
+command -v tmux >/dev/null || { echo "Error: install tmux first." >&2; exit 1; }
+if [[ "${1:-}" == "--prepare-only" ]]; then
+  python_bin="$(command -v python)" || { echo "Error: activate the training Python environment first." >&2; exit 1; }
+else
+  python_bin="$PWD/.venv-validated-py311/bin/python"
+  if [[ ! -x "$python_bin" ]]; then
+    python_bin="$(command -v python)" || { echo "Error: activate a training environment or use run_sft_remote.sh for automatic setup." >&2; exit 1; }
+  fi
+fi
+if [[ "${1:-}" != "--prepare-only" ]] && tmux has-session -t '=stories-sft' 2>/dev/null; then
+  echo "Error: tmux session stories-sft already exists; attach with: tmux attach -t stories-sft" >&2
+  exit 1
+fi
+
+if [[ -f data/stories.csv || -n "${STORY_DATA_URL:-}" ]]; then
+  mkdir -p data
+  source_csv="data/stories.csv"
+  download_path=""
+  if [[ ! -f "$source_csv" ]]; then
+    command -v curl >/dev/null || { echo "Error: install curl to download ROCStories." >&2; exit 1; }
+    download_path="$(mktemp data/stories-download.XXXXXX)"
+    trap 'rm -f -- "$download_path"' EXIT
+    curl --fail --location --retry 3 --connect-timeout 30 --max-time 600 \
+      --output "$download_path" "$STORY_DATA_URL"
+    source_csv="$download_path"
+  fi
+  "$python_bin" - "$source_csv" <<'PY'
+import csv
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+fields = [f"sentence{i}" for i in range(1, 6)]
+with open(sys.argv[1], newline="", encoding="utf-8-sig") as source:
+    reader = csv.DictReader(source)
+    if not set(fields).issubset(reader.fieldnames or []):
+        raise ValueError("Download is not a ROCStories CSV with sentence1 through sentence5.")
+    stories = []
+    for row_number, row in enumerate(reader, start=2):
+        if any(not row.get(field) or not row[field].strip() for field in fields):
+            raise ValueError(f"Missing story sentence at CSV row {row_number}.")
+        stories.append(" ".join(row[field].strip() for field in fields))
+if not stories:
+    raise ValueError("ROCStories CSV is empty.")
+target = Path("data/stories_sft.csv")
+with tempfile.NamedTemporaryFile(mode="w", newline="", encoding="utf-8",
+                                 dir=target.parent, delete=False) as output:
+    temporary_path = Path(output.name)
+    try:
+        writer = csv.writer(output)
+        writer.writerow(["text"])
+        writer.writerows([story] for story in stories)
+    except BaseException:
+        temporary_path.unlink()
+        raise
+try:
+    os.replace(temporary_path, target)
+finally:
+    temporary_path.unlink(missing_ok=True)
+print(f"Prepared {len(stories)} stories from the full supplied CSV: {target}")
+PY
+  if [[ -n "$download_path" ]]; then
+    mv "$download_path" data/stories.csv
+    trap - EXIT
+  fi
+elif [[ ! -f data/stories_sft.csv ]]; then
+  echo "Error: request ROCStories access at https://cs.rochester.edu/nlp/rocstories/." >&2
+  echo "Then set STORY_DATA_URL to the emailed CSV download link, or place the CSV at data/stories.csv." >&2
+  exit 1
+else
+  echo "Using existing data/stories_sft.csv; full-corpus preparation is not verified."
+fi
+
+if [[ "${1:-}" == "--prepare-only" ]]; then
+  exit 0
+fi
+
+mkdir -p output/stories_sft
+"$python_bin" - <<'PY'
+from pathlib import Path
+
+Path("output/stories_sft/preflight-passed.json").unlink(missing_ok=True)
+PY
+"$python_bin" -m pip freeze --all > output/stories_sft/requirements.lock.txt
+rm -f output/stories_sft/exit-status.txt output/stories_sft/active-log.txt
+printf -v worker_command '%q ' bash "$PWD/run_sft.sh" --worker "$python_bin" "${RUNPOD_CREDENTIALS_FILE:-}"
+tmux new-session -d -s stories-sft -c "$PWD" "$worker_command"
+tmux has-session -t '=stories-sft'
+echo "Started SFT. Attach with: tmux attach -t stories-sft"
+echo "Detach with Ctrl-b, then d. The session stays open after training exits."
+
+===== sft.py =====
+from runpod_util import register_pod_shutdown
+
+register_pod_shutdown()
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+import torch
+from accelerate import Accelerator
+from datasets import load_dataset
+from peft import LoraConfig
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig, HfArgumentParser, TrainingArguments
+
+from trl import SFTTrainer
+
+tqdm.pandas()
+
+# class ArithmeticDataset(torch.utils.data.Dataset):
+
+# Define and parse arguments.
+@dataclass
+class ScriptArguments:
+    model_name: Optional[str] = field(default="gpt2-large", metadata={"help": "the model name"})
+    dataset_path: Optional[str] = field(
+        default="data/stories_sft.csv", metadata={"help": "the dataset name"}
+    )
+    dataset_text_field: Optional[str] = field(default="text", metadata={"help": "the text field of the dataset"})
+    log_with: Optional[str] = field(default=None, metadata={"help": "use 'wandb' to log with wandb"})
+    learning_rate: Optional[float] = field(default=1e-4, metadata={"help": "the learning rate"})
+    batch_size: Optional[int] = field(default=32, metadata={"help": "the batch size"})
+    seq_length: Optional[int] = field(default=128, metadata={"help": "Input sequence length"})
+    gradient_accumulation_steps: Optional[int] = field(
+        default=32, metadata={"help": "the number of gradient accumulation steps"}
+    )
+    load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 8 bits precision"})
+    load_in_4bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 4 bits precision"})
+    use_peft: Optional[bool] = field(default=False, metadata={"help": "Wether to use PEFT or not to train adapters"})
+    trust_remote_code: Optional[bool] = field(default=True, metadata={"help": "Enable `trust_remote_code`"})
+    output_dir: Optional[str] = field(default="output", metadata={"help": "the output directory"})
+    peft_lora_r: Optional[int] = field(default=64, metadata={"help": "the r parameter of the LoRA adapters"})
+    peft_lora_alpha: Optional[int] = field(default=16, metadata={"help": "the alpha parameter of the LoRA adapters"})
+    logging_steps: Optional[int] = field(default=1, metadata={"help": "the number of logging steps"})
+    use_auth_token: Optional[bool] = field(default=True, metadata={"help": "Use HF auth token to access the model"})
+    num_train_epochs: Optional[int] = field(default=50, metadata={"help": "the number of training epochs"})
+    max_steps: Optional[int] = field(default=-1, metadata={"help": "the number of training steps"})
+    save_steps: Optional[int] = field(
+        default=100, metadata={"help": "Number of updates steps before two checkpoint saves"}
+    )
+    save_total_limit: Optional[int] = field(default=1, metadata={"help": "Limits total number of checkpoints."})
+    push_to_hub: Optional[bool] = field(default=False, metadata={"help": "Push the model to HF Hub"})
+    hub_model_id: Optional[str] = field(default=None, metadata={"help": "The name of the model on HF Hub"})
+
+
+parser = HfArgumentParser(ScriptArguments)
+script_args = parser.parse_args_into_dataclasses()[0]
+
+# Step 1: Load the model
+if script_args.load_in_8bit and script_args.load_in_4bit:
+    raise ValueError("You can't load the model in 8 bits and 4 bits at the same time")
+elif script_args.load_in_8bit or script_args.load_in_4bit:
+    quantization_config = BitsAndBytesConfig(
+        load_in_8bit=script_args.load_in_8bit, load_in_4bit=script_args.load_in_4bit
+    )
+    # Copy the model to each device
+    device_map = {"": Accelerator().local_process_index}
+    torch_dtype = torch.bfloat16
+else:
+    device_map = None
+    quantization_config = None
+    torch_dtype = None
+
+model = AutoModelForCausalLM.from_pretrained(
+    script_args.model_name,
+    quantization_config=quantization_config,
+    device_map=device_map,
+    trust_remote_code=script_args.trust_remote_code,
+    torch_dtype=torch_dtype,
+    use_auth_token=script_args.use_auth_token,
+)
+
+
+dataset = load_dataset("csv", data_files=script_args.dataset_path)["train"]
+
+# Step 3: Define the training arguments
+training_args = TrainingArguments(
+    output_dir=script_args.output_dir,
+    per_device_train_batch_size=script_args.batch_size,
+    gradient_accumulation_steps=script_args.gradient_accumulation_steps,
+    learning_rate=script_args.learning_rate,
+    logging_steps=script_args.logging_steps,
+    num_train_epochs=script_args.num_train_epochs,
+    max_steps=script_args.max_steps,
+    report_to=script_args.log_with or "none",
+    save_steps=script_args.save_steps,
+    save_total_limit=script_args.save_total_limit,
+    push_to_hub=script_args.push_to_hub,
+    hub_model_id=script_args.hub_model_id,
+)
+
+# Step 4: Define the LoraConfig
+if script_args.use_peft:
+    peft_config = LoraConfig(
+        r=script_args.peft_lora_r,
+        lora_alpha=script_args.peft_lora_alpha,
+        bias="none",
+        # target_modules=["Wqkv", "out_proj"]
+        task_type="CAUSAL_LM",
+    )
+else:
+    peft_config = None
+
+# Step 5: Define the Trainer
+trainer = SFTTrainer(
+    model=model,
+    args=training_args,
+    max_seq_length=script_args.seq_length,
+    train_dataset=dataset,
+    dataset_text_field=script_args.dataset_text_field,
+    peft_config=peft_config,
+)
+
+train_result = trainer.train()
+final_metrics = dict(train_result.metrics)
+final_metrics["epoch"] = trainer.state.epoch
+final_metrics["global_step"] = trainer.state.global_step
+trainer.log_metrics("train", final_metrics)
+trainer.save_metrics("train", final_metrics)
+
+# Step 6: Save the model
+trainer.save_model(script_args.output_dir)
+
+===== requirements.txt =====
+torch==2.1.0
+transformers==4.34.0
+peft==0.5.0
+wandb==0.15.12
+setuptools==80.9.0
+rich==13.6.0
+hydra-core==1.3.2
+editdistance==0.6.2
+bitsandbytes==0.41.1
+tqdm==4.66.1
+numpy==1.26.0
+trl==0.7.1
+scipy==1.11.3
+ipykernel==6.25.2
+accelerate==0.23.0
+datasets==2.14.6
+pandas==2.1.4
+pyarrow==14.0.2
+===== run_sft_remote.sh =====
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep edits during a long installation from changing the running shell program.
+if [[ "${1:-}" != "--snapshot" ]]; then
+  exec bash -c "$(cat -- "$0")" "$0" --snapshot "$@"
+fi
+shift
+
+cd "$(dirname "$0")"
+
+stage="${TRAINING_STAGE:-sft}"
+case "$stage" in
+  sft) session=stories-sft; worker=run_sft.sh ;;
+  gfn) session=stories-gfn; worker=run_gfn.sh ;;
+  *) echo "Error: unsupported training stage." >&2; exit 1 ;;
+esac
+output_name="${session//-/_}"
+output_path="output/$output_name"
+
+download_only=false
+if [[ "${1:-}" == "--download-only" ]]; then
+  download_only=true
+  shift
+fi
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "Usage: bash run_sft_remote.sh [--download-only] USER@HOST [SSH_PORT]" >&2
+  echo "Use RunPod's direct TCP SSH endpoint (supports SCP), or an SSH config alias." >&2
+  exit 1
+fi
+host="$1"
+port="${2:-22}"
+[[ "$host" != -* && "$port" =~ ^[0-9]+$ ]] || { echo "Error: invalid SSH host or port." >&2; exit 1; }
+for tool in ssh scp python3; do
+  command -v "$tool" >/dev/null || { echo "Error: $tool is required locally." >&2; exit 1; }
+done
+export RUNPOD_ENV_FILE="${RUNPOD_ENV_FILE:-$PWD/../../.env}"
+
+remote_dir="/workspace/gfns-llm/infill_subj_arithmetic"
+ssh_args=(-p "$port")
+scp_args=(-P "$port")
+download_results() {
+  echo "Waiting for training completion; keep this local terminal running."
+  echo "Disconnecting does not stop training; the updated pod worker requests shutdown on training exit."
+  completion_status="$(ssh "${ssh_args[@]}" "$host" \
+    "cd '$remote_dir' || exit 1
+     tail_pid=''
+     trap 'if [ -n \"\$tail_pid\" ]; then kill \"\$tail_pid\" 2>/dev/null; wait \"\$tail_pid\" 2>/dev/null; fi' EXIT
+     while [ ! -f '$output_path/exit-status.txt' ]; do
+       if [ -z \"\$tail_pid\" ] && [ -f '$output_path/active-log.txt' ]; then
+         IFS= read -r log_path < '$output_path/active-log.txt'
+         tail -n +1 -F \"\$log_path\" >&2 &
+         tail_pid=\$!
+       fi
+       if ! tmux has-session -t '=$session' 2>/dev/null; then
+         echo 'Error: no completion marker or running tmux session; inspect pod logs.' >&2
+         exit 1
+       fi
+       sleep 2
+     done
+     if [ -n \"\$tail_pid\" ]; then
+       sleep 2
+     elif [ -f '$output_path/active-log.txt' ]; then
+       IFS= read -r log_path < '$output_path/active-log.txt'
+       cat \"\$log_path\" >&2
+     fi
+     cat '$remote_dir/$output_path/exit-status.txt'")"
+  [[ "$completion_status" =~ ^[0-9]+$ ]] || { echo "Error: invalid remote completion status." >&2; exit 1; }
+  # Downloads are handled separately by download_results.sh.
+  echo "Results download disabled. Outputs remain at $remote_dir/$output_path on the pod."
+  if [[ "$completion_status" -ne 0 ]]; then
+    echo "Error: training failed with status $completion_status; inspect outputs on the pod." >&2
+    exit 1
+  fi
+}
+if [[ "$download_only" == true ]]; then
+  download_results
+  exit 0
+fi
+python3 -c 'from runpod_util import validate_runpod_config; validate_runpod_config()'
+
+dataset_path="${STORY_DATA_PATH:-}"
+dataset_url="${STORY_DATA_URL:-https://goo.gl/0OYkPK}"
+if [[ -n "$dataset_path" ]]; then
+  [[ -f "$dataset_path" ]] || { echo "Error: STORY_DATA_PATH is not an existing CSV file." >&2; exit 1; }
+elif [[ -z "$dataset_url" ]]; then
+  echo "ROCStories access: https://cs.rochester.edu/nlp/rocstories/"
+  echo "Submit the dataset access form; check your email (including spam) for the download link."
+  echo "Alternatively set STORY_DATA_PATH to an already downloaded ROCStories CSV."
+  read -r -p "Paste your authorized direct CSV URL (blank to stop): " dataset_url
+  [[ -n "$dataset_url" ]] || { echo "No dataset supplied; training was not started." >&2; exit 1; }
+fi
+
+if [[ "$stage" == gfn ]]; then
+  steps="${GFN_TRAIN_STEPS:-1000}"
+  [[ "$steps" =~ ^[1-9][0-9]*$ ]] || { echo "Error: GFN_TRAIN_STEPS must be positive." >&2; exit 1; }
+  if [[ -n "${SFT_MODEL_PATH:-}" ]]; then
+    [[ -f "$SFT_MODEL_PATH/config.json" ]] || { echo "Error: SFT_MODEL_PATH must contain a full SFT model." >&2; exit 1; }
+  fi
+fi
+
+ssh "${ssh_args[@]}" "$host" \
+  "mkdir -p '$remote_dir/data'; if command -v tmux >/dev/null; then
+     for session in stories-sft stories-gfn; do
+       if tmux has-session -t \"=\$session\" 2>/dev/null; then
+         echo \"Error: \$session already exists; close its completed tmux session or collect its outputs first.\" >&2
+         exit 1
+       fi
+     done
+   fi"
+scp "${scp_args[@]}" run_sft.sh run_sft_remote.sh sft.py requirements.txt validate_training_env.py runpod_util.py "$host:$remote_dir/"
+if [[ "$stage" == gfn ]]; then
+  scp "${scp_args[@]}" run_gfn.sh run_gfn_remote.sh main.py data.py rewards.py replay_buffer.py utils.py "$host:$remote_dir/"
+  scp "${scp_args[@]}" -r configs "$host:$remote_dir/"
+  if [[ -n "${SFT_MODEL_PATH:-}" ]]; then
+    ssh "${ssh_args[@]}" "$host" "mkdir -p '$remote_dir/input'"
+    scp "${scp_args[@]}" -r "$SFT_MODEL_PATH" "$host:$remote_dir/input/"
+    model_name="$(basename "$SFT_MODEL_PATH")"
+    remote_model="$remote_dir/input/$model_name"
+  else
+    remote_model="$remote_dir/output/stories_sft"
+  fi
+fi
+if [[ -n "$dataset_path" ]]; then
+  scp "${scp_args[@]}" "$dataset_path" "$host:$remote_dir/data/stories.csv"
+fi
+
+ssh "${ssh_args[@]}" "$host" "bash -s" <<'REMOTE'
+set -euo pipefail
+cd /workspace/gfns-llm/infill_subj_arithmetic
+missing=()
+command -v tmux >/dev/null || missing+=(tmux)
+command -v curl >/dev/null || missing+=(curl)
+command -v python3 >/dev/null || missing+=(python3)
+if [[ ${#missing[@]} -gt 0 ]]; then
+  if [[ "$(id -u)" != 0 ]] || ! command -v apt-get >/dev/null; then
+    echo "Error: install these tools on the pod first: ${missing[*]}" >&2
+    exit 1
+  fi
+  apt-get update
+  apt-get install -y "${missing[@]}"
+fi
+if [[ ! -x .venv-validated-py311/bin/python ]]; then
+  if ! command -v python3.11 >/dev/null && ! command -v uv >/dev/null; then
+    python3 -m pip install uv
+  fi
+  if command -v uv >/dev/null; then
+    uv python install 3.11
+    uv venv --seed --python 3.11 .venv-validated-py311
+  else
+    python3.11 -m venv .venv-validated-py311
+  fi
+fi
+if ! cmp -s requirements.txt .venv-validated-py311/installed-requirements.txt; then
+  .venv-validated-py311/bin/python -m pip install -r requirements.txt
+  cp requirements.txt .venv-validated-py311/installed-requirements.txt
+fi
+.venv-validated-py311/bin/python -m pip check
+.venv-validated-py311/bin/python -c 'import sys, torch; assert sys.version_info[:2] == (3, 11); assert torch.cuda.is_available(), "CUDA GPU unavailable"; print("CUDA GPU:", torch.cuda.get_device_name(0))'
+if [[ ! -x .venv-runpod-sdk/bin/python ]]; then
+  if command -v uv >/dev/null; then
+    uv venv --seed --python .venv-validated-py311/bin/python .venv-runpod-sdk
+  else
+    .venv-validated-py311/bin/python -m venv .venv-runpod-sdk
+  fi
+fi
+if ! .venv-runpod-sdk/bin/python -c 'import runpod' >/dev/null 2>&1; then
+  .venv-runpod-sdk/bin/python -m pip install 'runpod>=2.0,<3'
+fi
+.venv-runpod-sdk/bin/python -m pip check
+.venv-runpod-sdk/bin/python -c 'import runpod; from importlib.metadata import version; assert version("runpod").split(".")[0] == "2"; assert callable(runpod.stop_pod)'
+REMOTE
+
+credentials_file="$(python3 runpod_util.py --credentials |
+  ssh "${ssh_args[@]}" "$host" "cd '$remote_dir' && .venv-validated-py311/bin/python runpod_util.py --receive")"
+[[ "$credentials_file" =~ ^/tmp/gfn-runpod-[A-Za-z0-9_-]+$ ]] ||
+  { echo "Error: invalid remote credentials path; training was not started." >&2; exit 1; }
+printf -v start_command '%q ' bash "$remote_dir/$worker"
+if [[ "$stage" == gfn ]]; then
+  printf -v start_command '%q ' env "GFN_BASE_MODEL=$remote_model" "GFN_TRAIN_STEPS=$steps" bash "$remote_dir/$worker"
+fi
+printf -v remote_command '%q ' bash -c "cd \"$remote_dir\" && source .venv-validated-py311/bin/activate && IFS= read -r STORY_DATA_URL && export STORY_DATA_URL RUNPOD_CREDENTIALS_FILE='$credentials_file' && $start_command"
+if ! printf '%s\n' "$dataset_url" | ssh "${ssh_args[@]}" "$host" "$remote_command"; then
+  ssh "${ssh_args[@]}" "$host" "if ! tmux has-session -t '=$session' 2>/dev/null; then rm -f -- '$credentials_file'; fi" ||
+    echo "Error: remove $credentials_file on the pod manually." >&2
+  echo "Error: launch failed; verify pod training/status and stop it manually if idle." >&2
+  exit 1
+fi
+echo "Uploaded files and launched $stage on the pod."
+echo "The training process requests pod shutdown on exit, even with your laptop disconnected."
+echo "Shutdown is best effort; verify pod status. Results download is disabled."
+download_results
+
+===== validate_training_env.py =====
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+
+def validate():
+    project = Path(__file__).resolve().parent
+    marker = Path(sys.prefix) / "preflight-passed.json"
+    if sys.version_info[:2] != (3, 11) or not marker.is_file():
+        raise RuntimeError("Run run_preflight.sh on this pod first; a validated Python 3.11 environment is required.")
+    record = json.loads(marker.read_text())
+    digest = hashlib.sha256((project / "requirements.txt").read_bytes()).hexdigest()
+    if digest != record["requirements_sha256"]:
+        raise RuntimeError("Requirements changed since preflight; rerun run_preflight.sh.")
+    lock = Path(record["result_directory"]) / "requirements.lock.txt"
+    installed = subprocess.check_output(
+        [sys.executable, "-m", "pip", "freeze", "--all"], text=True
+    )
+    if sorted(installed.splitlines()) != sorted(lock.read_text().splitlines()):
+        raise RuntimeError("Installed packages changed since preflight; rerun run_preflight.sh.")
+    subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU unavailable.")
+    if torch.__version__ != record["torch"] or torch.version.cuda != record["cuda"]:
+        raise RuntimeError("PyTorch/CUDA build changed since preflight; rerun run_preflight.sh.")
+    print("Using preflight-validated environment:", sys.prefix)
+    print("CUDA GPU:", torch.cuda.get_device_name(0))
+    print("GPU memory (GiB):", round(torch.cuda.get_device_properties(0).total_memory / 2**30, 1))
+
+
+if __name__ == "__main__":
+    validate()
+
+===== output/stories_sft/requirements.lock.txt =====
+accelerate==0.23.0
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.5
+aiosignal==1.4.0
+antlr4-python3-runtime==4.9.3
+appdirs==1.4.4
+asttokens==3.0.2
+attrs==26.1.0
+bitsandbytes==0.41.1
+certifi==2026.10.23
+charset-normalizer==3.5.2
+click==8.5.1
+comm==0.2.3
+datasets==2.14.6
+debugpy==1.8.22
+dill==0.3.7
+docker-pycreds==0.4.0
+editdistance==0.6.2
+executing==2.3.0
+filelock==4.2.10
+frozenlist==1.8.0
+fsspec==2023.10.0
+gitdb==4.0.12
+GitPython==3.2.1
+huggingface-hub==0.17.3
+hydra-core==1.3.2
+idna==3.20
+ipykernel==6.25.2
+ipython==9.18.1
+ipython_pygments_lexers==1.1.1
+jedi==0.20.1
+Jinja2==3.1.6
+jupyter_client==8.10.0
+jupyter_core==5.9.1
+markdown-it-py==4.3.0
+MarkupSafe==3.0.4
+matplotlib-inline==0.2.2
+mdurl==0.1.2
+mpmath==1.3.0
+multidict==7.2.1
+multiprocess==0.70.15
+nest-asyncio==1.6.0
+networkx==3.6.1
+numpy==1.26.0
+nvidia-cublas-cu12==12.1.3.1
+nvidia-cuda-cupti-cu12==12.1.105
+nvidia-cuda-nvrtc-cu12==12.1.105
+nvidia-cuda-runtime-cu12==12.1.105
+nvidia-cudnn-cu12==8.9.2.26
+nvidia-cufft-cu12==11.0.2.54
+nvidia-curand-cu12==10.3.2.106
+nvidia-cusolver-cu12==11.4.5.107
+nvidia-cusparse-cu12==12.1.0.106
+nvidia-nccl-cu12==2.18.1
+nvidia-nvjitlink-cu12==12.9.86
+nvidia-nvtx-cu12==12.1.105
+omegaconf==2.3.1
+packaging==26.3
+pandas==2.1.4
+parso==0.8.7
+pathtools==0.1.2
+peft==0.5.0
+pexpect==4.9.0
+pip==26.3
+platformdirs==4.14.5
+prompt_toolkit==3.0.53
+propcache==0.5.4
+protobuf==4.25.9
+psutil==7.2.2
+ptyprocess==0.7.0
+pure_eval==0.2.4
+pyarrow==14.0.2
+Pygments==2.21.0
+python-dateutil==4.0.0
+pytz==2026.6
+PyYAML==6.0.3
+pyzmq==27.3.0
+regex==2026.11.9
+requests==2.34.2
+rich==13.6.0
+safetensors==0.8.0
+scipy==1.11.3
+sentry-sdk==2.74.0
+setproctitle==1.3.8
+setuptools==80.9.0
+six==1.17.0
+smmap==5.0.3
+stack-data==0.6.3
+sympy==1.14.0
+tokenizers==0.14.1
+torch==2.1.0
+tornado==6.6.1
+tqdm==4.66.1
+traitlets==5.16.1
+transformers==4.34.0
+triton==2.1.0
+trl==0.7.1
+typing_extensions==4.16.0
+tzdata==2026.6
+urllib3==2.8.0
+wandb==0.15.12
+wcwidth==0.9.4
+wheel==0.48.0
+xxhash==4.1.0
+yarl==1.25.1
+
+===== Training output =====
+Pod-side shutdown registered for training exit (success or failure).
+/workspace/gfns-llm/infill_subj_arithmetic/.venv-validated-py311/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py:472: FutureWarning: The `use_auth_token` argument is deprecated and will be removed in v5 of Transformers.
+  warnings.warn(
+Downloading config.json:   0%|          | 0.00/666 [00:00<?, ?B/s]Downloading config.json: 100%|██████████| 666/666 [00:00<00:00, 1.65MB/s]
+Downloading model.safetensors:   0%|          | 0.00/3.25G [00:00<?, ?B/s]Downloading model.safetensors:   0%|          | 10.5M/3.25G [00:00<02:33, 21.0MB/s]Downloading model.safetensors:   1%|▏         | 41.9M/3.25G [00:00<00:39, 81.6MB/s]Downloading model.safetensors:   2%|▏         | 62.9M/3.25G [00:00<00:33, 94.4MB/s]Downloading model.safetensors:   3%|▎         | 83.9M/3.25G [00:00<00:30, 105MB/s] Downloading model.safetensors:   3%|▎         | 105M/3.25G [00:01<00:26, 118MB/s] Downloading model.safetensors:   4%|▍         | 126M/3.25G [00:01<00:25, 123MB/s]Downloading model.safetensors:   5%|▍         | 147M/3.25G [00:01<00:24, 124MB/s]Downloading model.safetensors:   5%|▌         | 168M/3.25G [00:01<00:24, 127MB/s]Downloading model.safetensors:   6%|▌         | 189M/3.25G [00:01<00:22, 134MB/s]Downloading model.safetensors:   6%|▋         | 210M/3.25G [00:01<00:23, 127MB/s]Downloading model.safetensors:   7%|▋         | 231M/3.25G [00:02<00:23, 128MB/s]Downloading model.safetensors:   8%|▊         | 252M/3.25G [00:02<00:23, 130MB/s]Downloading model.safetensors:   8%|▊         | 273M/3.25G [00:02<00:21, 138MB/s]Downloading model.safetensors:   9%|▉         | 294M/3.25G [00:02<00:21, 135MB/s]Downloading model.safetensors:  10%|▉         | 315M/3.25G [00:02<00:21, 137MB/s]Downloading model.safetensors:  10%|█         | 336M/3.25G [00:02<00:21, 138MB/s]Downloading model.safetensors:  11%|█         | 357M/3.25G [00:02<00:20, 140MB/s]Downloading model.safetensors:  12%|█▏        | 377M/3.25G [00:03<00:21, 136MB/s]Downloading model.safetensors:  12%|█▏        | 398M/3.25G [00:03<00:21, 135MB/s]Downloading model.safetensors:  13%|█▎        | 419M/3.25G [00:03<00:20, 135MB/s]Downloading model.safetensors:  14%|█▎        | 440M/3.25G [00:03<00:19, 142MB/s]Downloading model.safetensors:  14%|█▍        | 461M/3.25G [00:03<00:20, 138MB/s]Downloading model.safetensors:  15%|█▍        | 482M/3.25G [00:03<00:20, 136MB/s]Downloading model.safetensors:  16%|█▌        | 503M/3.25G [00:04<00:22, 124MB/s]Downloading model.safetensors:  16%|█▋        | 535M/3.25G [00:04<00:18, 148MB/s]Downloading model.safetensors:  17%|█▋        | 556M/3.25G [00:04<00:18, 148MB/s]Downloading model.safetensors:  18%|█▊        | 577M/3.25G [00:04<00:18, 143MB/s]Downloading model.safetensors:  18%|█▊        | 598M/3.25G [00:04<00:18, 145MB/s]Downloading model.safetensors:  19%|█▉        | 619M/3.25G [00:04<00:18, 141MB/s]Downloading model.safetensors:  20%|█▉        | 640M/3.25G [00:04<00:18, 141MB/s]Downloading model.safetensors:  20%|██        | 661M/3.25G [00:05<00:19, 130MB/s]Downloading model.safetensors:  21%|██▏       | 692M/3.25G [00:05<00:15, 160MB/s]Downloading model.safetensors:  22%|██▏       | 713M/3.25G [00:05<00:14, 170MB/s]Downloading model.safetensors:  23%|██▎       | 744M/3.25G [00:05<00:12, 203MB/s]Downloading model.safetensors:  24%|██▍       | 776M/3.25G [00:05<00:13, 184MB/s]Downloading model.safetensors:  25%|██▍       | 797M/3.25G [00:05<00:15, 161MB/s]Downloading model.safetensors:  25%|██▌       | 818M/3.25G [00:05<00:14, 170MB/s]Downloading model.safetensors:  27%|██▋       | 881M/3.25G [00:06<00:08, 269MB/s]Downloading model.safetensors:  29%|██▊       | 933M/3.25G [00:06<00:07, 330MB/s]Downloading model.safetensors:  30%|███       | 975M/3.25G [00:06<00:09, 245MB/s]Downloading model.safetensors:  31%|███       | 1.01G/3.25G [00:06<00:10, 209MB/s]Downloading model.safetensors:  32%|███▏      | 1.05G/3.25G [00:06<00:09, 232MB/s]Downloading model.safetensors:  34%|███▍      | 1.10G/3.25G [00:06<00:08, 262MB/s]Downloading model.safetensors:  35%|███▍      | 1.13G/3.25G [00:07<00:10, 209MB/s]Downloading model.safetensors:  36%|███▌      | 1.16G/3.25G [00:07<00:09, 222MB/s]Downloading model.safetensors:  37%|███▋      | 1.22G/3.25G [00:07<00:07, 267MB/s]Downloading model.safetensors:  38%|███▊      | 1.25G/3.25G [00:07<00:09, 217MB/s]Downloading model.safetensors:  39%|███▉      | 1.28G/3.25G [00:07<00:10, 189MB/s]Downloading model.safetensors:  41%|████▏     | 1.34G/3.25G [00:08<00:07, 263MB/s]Downloading model.safetensors:  43%|████▎     | 1.38G/3.25G [00:08<00:08, 207MB/s]Downloading model.safetensors:  44%|████▎     | 1.42G/3.25G [00:08<00:09, 198MB/s]Downloading model.safetensors:  45%|████▌     | 1.47G/3.25G [00:08<00:06, 255MB/s]Downloading model.safetensors:  47%|████▋     | 1.51G/3.25G [00:08<00:07, 226MB/s]Downloading model.safetensors:  47%|████▋     | 1.54G/3.25G [00:09<00:08, 198MB/s]Downloading model.safetensors:  49%|████▉     | 1.59G/3.25G [00:09<00:06, 251MB/s]Downloading model.safetensors:  50%|█████     | 1.63G/3.25G [00:09<00:06, 248MB/s]Downloading model.safetensors:  51%|█████     | 1.66G/3.25G [00:09<00:08, 198MB/s]Downloading model.safetensors:  52%|█████▏    | 1.69G/3.25G [00:09<00:07, 199MB/s]Downloading model.safetensors:  54%|█████▍    | 1.75G/3.25G [00:09<00:05, 268MB/s]Downloading model.safetensors:  55%|█████▍    | 1.78G/3.25G [00:10<00:06, 216MB/s]Downloading model.safetensors:  56%|█████▌    | 1.81G/3.25G [00:10<00:07, 183MB/s]Downloading model.safetensors:  57%|█████▋    | 1.87G/3.25G [00:10<00:05, 234MB/s]Downloading model.safetensors:  59%|█████▉    | 1.91G/3.25G [00:10<00:05, 254MB/s]Downloading model.safetensors:  60%|██████    | 1.95G/3.25G [00:10<00:04, 267MB/s]Downloading model.safetensors:  61%|██████    | 1.98G/3.25G [00:11<00:06, 210MB/s]Downloading model.safetensors:  62%|██████▏   | 2.01G/3.25G [00:11<00:06, 194MB/s]Downloading model.safetensors:  63%|██████▎   | 2.06G/3.25G [00:11<00:05, 231MB/s]Downloading model.safetensors:  64%|██████▍   | 2.09G/3.25G [00:11<00:04, 247MB/s]Downloading model.safetensors:  65%|██████▌   | 2.12G/3.25G [00:11<00:05, 196MB/s]Downloading model.safetensors:  66%|██████▌   | 2.15G/3.25G [00:11<00:06, 175MB/s]Downloading model.safetensors:  68%|██████▊   | 2.21G/3.25G [00:12<00:04, 247MB/s]Downloading model.safetensors:  69%|██████▉   | 2.24G/3.25G [00:12<00:04, 217MB/s]Downloading model.safetensors:  70%|███████   | 2.28G/3.25G [00:12<00:05, 185MB/s]Downloading model.safetensors:  71%|███████   | 2.31G/3.25G [00:12<00:04, 197MB/s]Downloading model.safetensors:  73%|███████▎  | 2.36G/3.25G [00:12<00:03, 242MB/s]Downloading model.safetensors:  74%|███████▎  | 2.39G/3.25G [00:12<00:04, 196MB/s]Downloading model.safetensors:  75%|███████▍  | 2.42G/3.25G [00:13<00:04, 196MB/s]Downloading model.safetensors:  76%|███████▌  | 2.47G/3.25G [00:13<00:03, 249MB/s]Downloading model.safetensors:  77%|███████▋  | 2.51G/3.25G [00:13<00:03, 229MB/s]Downloading model.safetensors:  78%|███████▊  | 2.54G/3.25G [00:13<00:03, 178MB/s]Downloading model.safetensors:  79%|███████▉  | 2.57G/3.25G [00:13<00:03, 192MB/s]Downloading model.safetensors:  81%|████████  | 2.62G/3.25G [00:13<00:02, 237MB/s]Downloading model.safetensors:  82%|████████▏ | 2.65G/3.25G [00:14<00:04, 143MB/s]Downloading model.safetensors:  84%|████████▍ | 2.73G/3.25G [00:14<00:02, 221MB/s]Downloading model.safetensors:  85%|████████▌ | 2.77G/3.25G [00:14<00:02, 221MB/s]Downloading model.safetensors:  86%|████████▌ | 2.80G/3.25G [00:15<00:02, 183MB/s]Downloading model.safetensors:  87%|████████▋ | 2.83G/3.25G [00:15<00:02, 186MB/s]Downloading model.safetensors:  88%|████████▊ | 2.87G/3.25G [00:15<00:01, 224MB/s]Downloading model.safetensors:  89%|████████▉ | 2.90G/3.25G [00:15<00:01, 221MB/s]Downloading model.safetensors:  90%|█████████ | 2.94G/3.25G [00:15<00:01, 191MB/s]Downloading model.safetensors:  91%|█████████▏| 2.97G/3.25G [00:15<00:01, 191MB/s]Downloading model.safetensors:  93%|█████████▎| 3.02G/3.25G [00:15<00:00, 251MB/s]Downloading model.safetensors:  94%|█████████▍| 3.05G/3.25G [00:16<00:00, 200MB/s]Downloading model.safetensors:  95%|█████████▍| 3.08G/3.25G [00:16<00:00, 171MB/s]Downloading model.safetensors:  96%|█████████▌| 3.12G/3.25G [00:16<00:00, 212MB/s]Downloading model.safetensors:  98%|█████████▊| 3.17G/3.25G [00:16<00:00, 222MB/s]Downloading model.safetensors:  98%|█████████▊| 3.20G/3.25G [00:17<00:00, 179MB/s]Downloading model.safetensors:  99%|█████████▉| 3.23G/3.25G [00:17<00:00, 175MB/s]Downloading model.safetensors: 100%|██████████| 3.25G/3.25G [00:17<00:00, 188MB/s]
+/workspace/gfns-llm/infill_subj_arithmetic/.venv-validated-py311/lib/python3.11/site-packages/transformers/utils/hub.py:374: FutureWarning: The `use_auth_token` argument is deprecated and will be removed in v5 of Transformers.
+  warnings.warn(
+Downloading generation_config.json:   0%|          | 0.00/124 [00:00<?, ?B/s]Downloading generation_config.json: 100%|██████████| 124/124 [00:00<00:00, 373kB/s]
+Downloading data files:   0%|          | 0/1 [00:00<?, ?it/s]Downloading data files: 100%|██████████| 1/1 [00:00<00:00, 4629.47it/s]
+Extracting data files:   0%|          | 0/1 [00:00<?, ?it/s]Extracting data files: 100%|██████████| 1/1 [00:00<00:00, 243.26it/s]
+Generating train split: 0 examples [00:00, ? examples/s]Generating train split: 10000 examples [00:00, 60576.14 examples/s]Generating train split: 50000 examples [00:00, 191305.25 examples/s]Generating train split: 52665 examples [00:00, 173848.42 examples/s]
+Downloading tokenizer_config.json:   0%|          | 0.00/26.0 [00:00<?, ?B/s]Downloading tokenizer_config.json: 100%|██████████| 26.0/26.0 [00:00<00:00, 139kB/s]
+Downloading vocab.json: 0.00B [00:00, ?B/s]Downloading vocab.json: 269kB [00:00, 2.46MB/s]Downloading vocab.json: 516kB [00:00, 1.85MB/s]Downloading vocab.json: 779kB [00:00, 2.13MB/s]Downloading vocab.json: 1.04MB [00:00, 2.44MB/s]
+Downloading merges.txt: 0.00B [00:00, ?B/s]Downloading merges.txt: 176kB [00:00, 1.68MB/s]Downloading merges.txt: 352kB [00:00, 1.28MB/s]Downloading merges.txt: 456kB [00:00, 1.39MB/s]
+Downloading tokenizer.json: 0.00B [00:00, ?B/s]Downloading tokenizer.json: 131kB [00:00, 711kB/s]Downloading tokenizer.json: 319kB [00:00, 1.22MB/s]Downloading tokenizer.json: 459kB [00:00, 1.11MB/s]Downloading tokenizer.json: 734kB [00:00, 1.62MB/s]Downloading tokenizer.json: 1.10MB [00:00, 2.23MB/s]Downloading tokenizer.json: 1.36MB [00:00, 1.95MB/s]
+Using pad_token, but it is not set yet.
+Map:   0%|          | 0/52665 [00:00<?, ? examples/s]Map:   6%|▌         | 3000/52665 [00:00<00:03, 12514.79 examples/s]Map:  13%|█▎        | 7000/52665 [00:00<00:02, 18660.59 examples/s]Map:  21%|██        | 11000/52665 [00:00<00:01, 22088.88 examples/s]Map:  28%|██▊       | 15000/52665 [00:00<00:01, 23962.36 examples/s]Map:  36%|███▌      | 19000/52665 [00:00<00:01, 24735.59 examples/s]Map:  44%|████▎     | 23000/52665 [00:01<00:01, 24226.18 examples/s]Map:  51%|█████▏    | 27000/52665 [00:01<00:01, 24026.70 examples/s]Map:  59%|█████▉    | 31000/52665 [00:01<00:00, 23725.19 examples/s]Map:  66%|██████▋   | 35000/52665 [00:01<00:00, 23243.83 examples/s]Map:  74%|███████▍  | 39000/52665 [00:01<00:00, 20414.72 examples/s]Map:  82%|████████▏ | 43000/52665 [00:01<00:00, 21529.10 examples/s]Map:  89%|████████▉ | 47000/52665 [00:02<00:00, 22577.22 examples/s]Map:  97%|█████████▋| 51000/52665 [00:02<00:00, 23414.56 examples/s]Map: 100%|██████████| 52665/52665 [00:02<00:00, 22589.18 examples/s]
+  0%|          | 0/50 [00:00<?, ?it/s]You're using a GPT2TokenizerFast tokenizer. Please note that with a fast tokenizer, using the `__call__` method is faster than using a method to encode the text followed by a call to the `pad` method to get a padded encoding.
+  2%|▏         | 1/50 [00:20<16:46, 20.54s/it]                                              {'loss': 3.0178, 'learning_rate': 0.00049, 'epoch': 0.04}
+  2%|▏         | 1/50 [00:20<16:46, 20.54s/it]  4%|▍         | 2/50 [00:39<15:32, 19.43s/it]                                              {'loss': 8.3855, 'learning_rate': 0.00048, 'epoch': 0.08}
+  4%|▍         | 2/50 [00:39<15:32, 19.43s/it]  6%|▌         | 3/50 [00:58<15:04, 19.24s/it]                                              {'loss': 9.0522, 'learning_rate': 0.00047, 'epoch': 0.12}
+  6%|▌         | 3/50 [00:58<15:04, 19.24s/it]  8%|▊         | 4/50 [01:16<14:33, 18.99s/it]                                              {'loss': 6.1266, 'learning_rate': 0.00046, 'epoch': 0.16}
+  8%|▊         | 4/50 [01:16<14:33, 18.99s/it] 10%|█         | 5/50 [01:35<14:05, 18.79s/it]                                              {'loss': 5.2298, 'learning_rate': 0.00045000000000000004, 'epoch': 0.19}
+ 10%|█         | 5/50 [01:35<14:05, 18.79s/it] 12%|█▏        | 6/50 [01:53<13:42, 18.69s/it]                                              {'loss': 4.5639, 'learning_rate': 0.00044, 'epoch': 0.23}
+ 12%|█▏        | 6/50 [01:53<13:42, 18.69s/it] 14%|█▍        | 7/50 [02:12<13:21, 18.65s/it]                                              {'loss': 4.2153, 'learning_rate': 0.00043, 'epoch': 0.27}
+ 14%|█▍        | 7/50 [02:12<13:21, 18.65s/it] 16%|█▌        | 8/50 [02:30<13:01, 18.60s/it]                                              {'loss': 3.6249, 'learning_rate': 0.00042, 'epoch': 0.31}
+ 16%|█▌        | 8/50 [02:30<13:01, 18.60s/it] 18%|█▊        | 9/50 [02:49<12:38, 18.50s/it]                                              {'loss': 3.3795, 'learning_rate': 0.00041, 'epoch': 0.35}
+ 18%|█▊        | 9/50 [02:49<12:38, 18.50s/it] 20%|██        | 10/50 [03:07<12:19, 18.48s/it]                                               {'loss': 3.2695, 'learning_rate': 0.0004, 'epoch': 0.39}
+ 20%|██        | 10/50 [03:07<12:19, 18.48s/it] 22%|██▏       | 11/50 [03:26<12:03, 18.55s/it]                                               {'loss': 3.1236, 'learning_rate': 0.00039000000000000005, 'epoch': 0.43}
+ 22%|██▏       | 11/50 [03:26<12:03, 18.55s/it] 24%|██▍       | 12/50 [03:44<11:46, 18.61s/it]                                               {'loss': 3.0177, 'learning_rate': 0.00038, 'epoch': 0.47}
+ 24%|██▍       | 12/50 [03:44<11:46, 18.61s/it] 26%|██▌       | 13/50 [04:03<11:28, 18.61s/it]                                               {'loss': 2.926, 'learning_rate': 0.00037, 'epoch': 0.51}
+ 26%|██▌       | 13/50 [04:03<11:28, 18.61s/it] 28%|██▊       | 14/50 [04:22<11:09, 18.60s/it]                                               {'loss': 2.8988, 'learning_rate': 0.00035999999999999997, 'epoch': 0.54}
+ 28%|██▊       | 14/50 [04:22<11:09, 18.60s/it] 30%|███       | 15/50 [04:40<10:49, 18.55s/it]                                               {'loss': 2.8328, 'learning_rate': 0.00035, 'epoch': 0.58}
+ 30%|███       | 15/50 [04:40<10:49, 18.55s/it] 32%|███▏      | 16/50 [04:59<10:30, 18.54s/it]                                               {'loss': 2.8064, 'learning_rate': 0.00034, 'epoch': 0.62}
+ 32%|███▏      | 16/50 [04:59<10:30, 18.54s/it] 34%|███▍      | 17/50 [05:17<10:12, 18.57s/it]                                               {'loss': 2.7825, 'learning_rate': 0.00033, 'epoch': 0.66}
+ 34%|███▍      | 17/50 [05:17<10:12, 18.57s/it] 36%|███▌      | 18/50 [05:36<09:54, 18.58s/it]                                               {'loss': 2.7645, 'learning_rate': 0.00032, 'epoch': 0.7}
+ 36%|███▌      | 18/50 [05:36<09:54, 18.58s/it] 38%|███▊      | 19/50 [05:55<09:37, 18.61s/it]                                               {'loss': 2.7324, 'learning_rate': 0.00031, 'epoch': 0.74}
+ 38%|███▊      | 19/50 [05:55<09:37, 18.61s/it] 40%|████      | 20/50 [06:13<09:17, 18.58s/it]                                               {'loss': 2.695, 'learning_rate': 0.0003, 'epoch': 0.78}
+ 40%|████      | 20/50 [06:13<09:17, 18.58s/it] 42%|████▏     | 21/50 [06:32<09:01, 18.67s/it]                                               {'loss': 2.6979, 'learning_rate': 0.00029, 'epoch': 0.82}
+ 42%|████▏     | 21/50 [06:32<09:01, 18.67s/it] 44%|████▍     | 22/50 [06:51<08:43, 18.71s/it]                                               {'loss': 2.6802, 'learning_rate': 0.00028000000000000003, 'epoch': 0.86}
+ 44%|████▍     | 22/50 [06:51<08:43, 18.71s/it] 46%|████▌     | 23/50 [07:09<08:21, 18.58s/it]                                               {'loss': 2.6549, 'learning_rate': 0.00027, 'epoch': 0.89}
+ 46%|████▌     | 23/50 [07:09<08:21, 18.58s/it] 48%|████▊     | 24/50 [07:28<08:02, 18.57s/it]                                               {'loss': 2.642, 'learning_rate': 0.00026000000000000003, 'epoch': 0.93}
+ 48%|████▊     | 24/50 [07:28<08:02, 18.57s/it] 50%|█████     | 25/50 [07:46<07:42, 18.49s/it]                                               {'loss': 2.6403, 'learning_rate': 0.00025, 'epoch': 0.97}
+ 50%|█████     | 25/50 [07:46<07:42, 18.49s/it] 52%|█████▏    | 26/50 [08:04<07:23, 18.47s/it]                                               {'loss': 2.5854, 'learning_rate': 0.00024, 'epoch': 1.01}
+ 52%|█████▏    | 26/50 [08:04<07:23, 18.47s/it]
+===== Completion =====
+Finished: 2026-11-12T00:54:20Z
+Exit status: 137
+Model output directory: /workspace/gfns-llm/infill_subj_arithmetic/output/stories_sft

@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.venv*/
+__pycache__/
+*.py[cod]
+.DS_Store
+.ipynb_checkpoints/
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+infill_subj_arithmetic/output/
+infill_subj_arithmetic/data/*.csv
+infill_subj_arithmetic/results/**/.evaluation_cache/

@@ -1,0 +1,68 @@
+reward:
+  impose_vocab_constraint: false
+  reward_name: FrozenModel
+  reward_config:
+    temperature: 1
+    solution_beta: 1
+    len_beta: 0
+    vocab_alpha: -99
+dataset:
+  name: stories_in_prompt_2
+  path: data/stories.csv
+  max_data: 10000
+  use_rationales: true
+  sol_prefix: '. '
+model:
+  use_4bit: ${use_4bit}
+  test_only: ${test_only}
+  load_checkpoint_path: ${load_checkpoint_path}
+  name: /workspace/gfns-llm/infill_subj_arithmetic/input/stories_sft
+  device: cuda
+  use_lora: true
+  save_path: null
+  lora_config:
+    r: 64
+    alpha: 16
+    target_modules:
+    - c_attn
+    - c_proj
+    dropout: 0.1
+    bias: none
+test_only: false
+load_checkpoint_path: null
+seed: 0
+use_4bit: false
+subtb_lambda: 1.0
+max_len: 25
+max_eval_len: 25
+min_len: 5
+operators:
+- +
+- '-'
+limit_capability: -1
+loss_type: modified_subtb
+wandb_mode: disabled
+use_replay_buffer: true
+batch_size: 64
+train_steps: 1000
+eval_bsz: 10
+grad_acc: 16
+lr: 0.0001
+lr_logZ: 1.0
+pf_temp_high: 2
+pf_temp_low: 0.5
+logZ_init: 0.0
+eval_interval: 10
+full_eval_interval: 50
+log_interval: 10
+eval_temp: 0.9
+use_reward_sched: true
+use_tools: false
+reward_sched:
+  start: 1.1
+  end: 0.85
+  horizon: 100
+replay_buffer:
+  size: 25
+  use_tools: ${use_tools}
+save_final: true

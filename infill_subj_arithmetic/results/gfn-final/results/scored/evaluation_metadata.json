@@ -1,0 +1,85 @@
+{
+  "dataset": {
+    "csv_path": "/workspace/gfns-llm/infill_subj_arithmetic/data/story-cloze-winter2018-val.csv",
+    "csv_sha256": "1e8f4987664c12889426465481d998f843ad844cc97ba5d99f30c9032329664b",
+    "source_stories": 1571,
+    "source_format": "story_cloze_adapted_infilling",
+    "duplicates_removed": 0,
+    "excluded_training_matches": 0,
+    "selected_stories": 900,
+    "selection_seed": 0,
+    "overlap_status": "no_normalized_story_prompt_or_context_match_in_supplied_training_csv",
+    "training_csv": "/workspace/gfns-llm/infill_subj_arithmetic/data/stories.csv",
+    "training_csv_sha256": "beadc8cdddc21d18e9d2b7273f817ac833e96ce837cc9661bb74829a67da1c4f"
+  },
+  "settings": {
+    "samples_per_story": 2,
+    "max_new_tokens": 25,
+    "min_new_tokens": 0,
+    "temperature": 0.9,
+    "generation_seed": 0,
+    "device": "cuda",
+    "model_dtype": "torch.float32",
+    "models": [
+      "SFT",
+      "GFN"
+    ],
+    "sft_dir": "/workspace/gfns-llm/infill_subj_arithmetic/output/stories_sft",
+    "gfn_adapter_dir": "/workspace/gfns-llm/infill_subj_arithmetic/output/stories_gfn/final_adapter",
+    "cuda": {
+      "name": "NVIDIA H100 80GB HBM3",
+      "capability": [
+        9,
+        0
+      ],
+      "runtime": "12.1"
+    },
+    "generation_chunk_size": 50,
+    "evaluations": {
+      "general": true,
+      "paper": true
+    },
+    "text_metrics": {
+      "model_dir": "/workspace/gfns-llm/infill_subj_arithmetic/models/deberta-xlarge-mnli",
+      "num_layers": 40,
+      "rescale_with_baseline": false,
+      "device": "cuda",
+      "batch_size": 16,
+      "model_assets": [
+        {
+          "path": "config.json",
+          "size": 792,
+          "mtime_ns": 1794624950192335212,
+          "ctime_ns": 1794625033580719823
+        },
+        {
+          "path": "merges.txt",
+          "size": 456318,
+          "mtime_ns": 1794624950210395171,
+          "ctime_ns": 1794625062156437569
+        },
+        {
+          "path": "pytorch_model.bin",
+          "size": 3035556896,
+          "mtime_ns": 1794624968141321073,
+          "ctime_ns": 1794626472443495665
+        },
+        {
+          "path": "tokenizer_config.json",
+          "size": 52,
+          "mtime_ns": 1794624950309813160,
+          "ctime_ns": 1794625033573341243
+        },
+        {
+          "path": "vocab.json",
+          "size": 898825,
+          "mtime_ns": 1794624950225203543,
+          "ctime_ns": 1794625062135264645
+        }
+      ],
+      "nltk": "3.10.4",
+      "bert_score": "0.3.13",
+      "transformers": "4.34.0"
+    }
+  }
+}

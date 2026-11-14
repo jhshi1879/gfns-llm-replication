@@ -1,0 +1,99 @@
+{
+  "dataset": {
+    "csv_path": "/workspace/gfns-llm/infill_subj_arithmetic/data/story-cloze-winter2018-val.csv",
+    "csv_sha256": "1e8f4987664c12889426465481d998f843ad844cc97ba5d99f30c9032329664b",
+    "source_stories": 1571,
+    "source_format": "story_cloze_adapted_infilling",
+    "duplicates_removed": 0,
+    "excluded_training_matches": 0,
+    "selected_stories": 100,
+    "selection_seed": 0,
+    "overlap_status": "no_normalized_story_prompt_or_context_match_in_supplied_training_csv",
+    "training_csv": "/workspace/gfns-llm/infill_subj_arithmetic/data/stories.csv",
+    "training_csv_sha256": "beadc8cdddc21d18e9d2b7273f817ac833e96ce837cc9661bb74829a67da1c4f",
+    "paper_comparison_selection": "first 100 stories from the seeded held-out sample"
+  },
+  "settings": {
+    "samples_per_story": 2,
+    "max_new_tokens": 25,
+    "min_new_tokens": 0,
+    "temperature": 0.9,
+    "generation_seed": 0,
+    "device": "cuda",
+    "model_dtype": "torch.float32",
+    "models": [
+      "SFT",
+      "GFN"
+    ],
+    "sft_dir": "/workspace/gfns-llm/infill_subj_arithmetic/output/stories_sft",
+    "gfn_adapter_dir": "/workspace/gfns-llm/infill_subj_arithmetic/output/stories_gfn/final_adapter",
+    "cuda": {
+      "name": "NVIDIA H100 80GB HBM3",
+      "capability": [
+        9,
+        0
+      ],
+      "runtime": "12.1"
+    },
+    "generation_chunk_size": 50,
+    "evaluations": {
+      "general": true,
+      "paper": true
+    },
+    "text_metrics": {
+      "model_dir": "/workspace/gfns-llm/infill_subj_arithmetic/models/deberta-xlarge-mnli",
+      "num_layers": 40,
+      "rescale_with_baseline": true,
+      "device": "cuda",
+      "batch_size": 16,
+      "model_assets": [
+        {
+          "path": "config.json",
+          "size": 792,
+          "mtime_ns": 1794624950192335212,
+          "ctime_ns": 1794625033580719823
+        },
+        {
+          "path": "merges.txt",
+          "size": 456318,
+          "mtime_ns": 1794624950210395171,
+          "ctime_ns": 1794625062156437569
+        },
+        {
+          "path": "pytorch_model.bin",
+          "size": 3035556896,
+          "mtime_ns": 1794624968141321073,
+          "ctime_ns": 1794626472443495665
+        },
+        {
+          "path": "tokenizer_config.json",
+          "size": 52,
+          "mtime_ns": 1794624950309813160,
+          "ctime_ns": 1794625033573341243
+        },
+        {
+          "path": "vocab.json",
+          "size": 898825,
+          "mtime_ns": 1794624950225203543,
+          "ctime_ns": 1794625062135264645
+        }
+      ],
+      "nltk": "3.10.4",
+      "bert_score": "0.3.13",
+      "transformers": "4.34.0"
+    },
+    "paper_comparison": {
+      "paper": "Hu et al., Amortizing Intractable Inference in Large Language Models, Table 2",
+      "dataset_note": "Adapted held-out validation stories, not the paper ROCStories test split.",
+      "training_note": "The SFT base used here was trained on the full supplied corpus, not the paper SFT setup.",
+      "model_note": "Config compatibility checked; exact DeBERTa-xlarge-MNLI weight provenance is not verified.",
+      "metrics_note": "BLEU-4 uses sentence BLEU method1; GLEU uses sentence GLEU. Both use full stripped text and are reported as percentages. BERTScore uses layer 40 and the bundled rescale baseline, matching the legacy scoring configuration but not its character slicing.",
+      "bertscore_baseline_path": "/workspace/gfns-llm/infill_subj_arithmetic/.venv-eval-py311/lib/python3.11/site-packages/bert_score/rescale_baseline/en/microsoft/deberta-xlarge-mnli.tsv",
+      "bertscore_baseline_sha256": "e9ea1c46dddcf57e19f6e6a57eabcfc38eefa85d4377b39e6b810741be9c2129",
+      "bertscore_baseline_f1": 0.5150192,
+      "empty_generation_note": "Empty strings have zero raw BLEU, GLEU and BERTScore; raw BERTScore is then rescaled.",
+      "uncertainty_note": "Paper plus/minus notation is transcribed as reported; its interpretation is not assumed. Our intervals are story-level percentile bootstraps.",
+      "missing_baselines": "Prompting and GPT4Eval are not run; no story text is sent to external services."
+    }
+  }
+}
