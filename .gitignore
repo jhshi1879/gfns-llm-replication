@@ -11,6 +11,7 @@ __pycache__/
 *.pth
 *.safetensors
 *.ckpt
+*.sh
 infill_subj_arithmetic/output/
 infill_subj_arithmetic/data/*.csv
 infill_subj_arithmetic/results/**/.evaluation_cache/

@@ -1,6 +1,6 @@
 {
   "dataset": {
-    "csv_path": "/Users/jhshi/Desktop/algoverse-9-20/GFNs/gfns-llm/infill_subj_arithmetic/data/story-cloze-winter2018-val.csv",
+    "csv_path": "infill_subj_arithmetic/data/story-cloze-winter2018-val.csv",
     "csv_sha256": "1e8f4987664c12889426465481d998f843ad844cc97ba5d99f30c9032329664b",
     "source_stories": 1571,
     "source_format": "story_cloze_adapted_infilling",
@@ -9,7 +9,7 @@
     "selected_stories": 3,
     "selection_seed": 0,
     "overlap_status": "no_normalized_story_prompt_or_context_match_in_supplied_training_csv",
-    "training_csv": "/Users/jhshi/Desktop/algoverse-9-20/GFNs/gfns-llm/infill_subj_arithmetic/data/rocstories-eval-winter2017.csv"
+    "training_csv": "infill_subj_arithmetic/data/rocstories-eval-winter2017.csv"
   },
   "settings": {
     "samples_per_story": 2,
@@ -22,7 +22,7 @@
     "models": [
       "SFT"
     ],
-    "sft_dir": "/Users/jhshi/Desktop/algoverse-9-20/GFNs/gfns-llm/infill_subj_arithmetic/results/output-download-20261111-195140.tBUbSk/stories_sft",
-    "gfn_adapter_dir": "/Users/jhshi/Desktop/algoverse-9-20/GFNs/gfns-llm/infill_subj_arithmetic/results/gfn-final/final_adapter"
+    "sft_dir": "infill_subj_arithmetic/results/output-download-20261111-195140.tBUbSk/stories_sft",
+    "gfn_adapter_dir": "infill_subj_arithmetic/results/gfn-final/final_adapter"
   }
 }
